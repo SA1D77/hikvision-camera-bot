@@ -2,21 +2,19 @@ import time
 from typing import Literal
 
 from httpx import ConnectError
-from tenacity import retry, retry_if_exception_type, wait_fixed
 
 from hikcamerabot.enums import DetectionType, ServiceType
 from hikcamerabot.exceptions import AlarmEventChunkDetectorError, ChunkLoopError
 from hikcamerabot.services.abstract import AbstractServiceTask
 from hikcamerabot.services.alarm.camera.chunk import AlarmEventChunkDetector
 from hikcamerabot.services.alarm.camera.notifier import AlarmNotifier
+from hikcamerabot.utils.task import retry_forever
 
 
 class ServiceAlarmMonitoringTask(AbstractServiceTask):
     """Alarm Pusher Service Class."""
 
     TYPE: Literal[ServiceType.ALARM] = ServiceType.ALARM
-
-    RETRY_WAIT: float = 0.5
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -25,33 +23,29 @@ class ServiceAlarmMonitoringTask(AbstractServiceTask):
             alert_count=self.service.alert_count,
         )
 
-    @retry(retry=retry_if_exception_type(Exception), wait=wait_fixed(RETRY_WAIT))
     async def run(self) -> None:
+        """Monitor alarm/alert chunks, reconnecting with backoff on errors."""
+        await retry_forever(
+            self._run, logger=self._log, name=f'{self._cam.id} alert pusher task'
+        )
+
+    async def _run(self) -> None:
         """Monitor and process alarm/alert chunks from Hikvision Camera."""
         self._log.info('[%s] Starting alert pusher task', self._cam.id)
         try:
             await self._process_chunks()
         except ChunkLoopError:
             self._log.error(
-                '[%s] Unexpectedly exited from stream chunk processing loop. '
-                'Retrying in %s seconds...',
+                '[%s] Unexpectedly exited from stream chunk processing loop',
                 self._cam.id,
-                self.RETRY_WAIT,
             )
             raise
         except ConnectError:
-            self._log.error(
-                '[%s] Failed to connect to Alert Stream. Retrying in %s seconds...',
-                self._cam.id,
-                self.RETRY_WAIT,
-            )
+            self._log.error('[%s] Failed to connect to Alert Stream', self._cam.id)
             raise
         except Exception:
             self._log.exception(
-                '[%s] Unknown exception in %s. Retrying in %s seconds...',
-                self._cam.id,
-                self.__class__.__name__,
-                self.RETRY_WAIT,
+                '[%s] Unknown exception in %s', self._cam.id, self.__class__.__name__
             )
             raise
 

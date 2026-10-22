@@ -2,7 +2,6 @@ import logging
 import time
 
 from httpx import ConnectError
-from tenacity import retry, retry_if_exception_type, wait_fixed
 
 from hikcamerabot.camera import HikvisionCam
 from hikcamerabot.enums import DetectionType
@@ -12,12 +11,13 @@ from hikcamerabot.services.alarm.camera.chunk import (
     CameraNvrChannelNameDetector,
 )
 from hikcamerabot.services.alarm.camera.notifier import AlarmNotifier
+from hikcamerabot.utils.task import retry_forever
 
 
 class NvrAlarmMonitoringTask:
     """NVR Alarm Pusher Class."""
 
-    RETRY_WAIT: int = 0.5
+    ALERT_DELAY: int = 15
 
     def __init__(
         self,
@@ -45,33 +45,31 @@ class NvrAlarmMonitoringTask:
         self._run_forever = run_forever
         self._cls_name = self.__class__.__name__
 
-    @retry(retry=retry_if_exception_type(Exception), wait=wait_fixed(RETRY_WAIT))
     async def run(self) -> None:
+        """Monitor NVR alarm chunks, reconnecting with backoff on errors."""
+        await retry_forever(
+            self._run, logger=self._log, name=f'NVR "{self._host}" alarm task'
+        )
+
+    async def _run(self) -> None:
         """Monitor and process alarm/alert chunks from NVR Alarm Stream."""
         self._log.info('Starting NVR Alarm Monitoring Task')
         try:
             await self._process_chunks()
         except ChunkLoopError:
             self._log.error(
-                'Unexpectedly exited from NVR "%s" Alert Stream chunk processing loop. '
-                'Retrying in %s seconds...',
+                'Unexpectedly exited from NVR "%s" Alert Stream chunk processing loop',
                 self._host,
-                self.RETRY_WAIT,
             )
             raise
         except ConnectError:
-            self._log.error(
-                'Failed to connect to NVR "%s" Alert Stream. Retrying in %s seconds...',
-                self._host,
-                self.RETRY_WAIT,
-            )
+            self._log.error('Failed to connect to NVR "%s" Alert Stream', self._host)
             raise
         except Exception:
             self._log.exception(
-                'Unknown exception in "%s" for "%s". Retrying in %s seconds...',
+                'Unknown exception in "%s" for "%s"',
                 self.__class__.__name__,
                 self._host,
-                self.RETRY_WAIT,
             )
             raise
 
@@ -89,17 +87,34 @@ class NvrAlarmMonitoringTask:
 
             if detection_type:
                 cam = self._parse_cam(chunk)
-                if int(time.time()) < self._cam_delays[cam]:
+                if cam is None or int(time.time()) < self._cam_delays[cam]:
                     continue
                 self._send_alerts(cam=cam, detection_type=detection_type)
-                self._cam_delays[cam] = int(time.time()) + 15
+                self._cam_delays[cam] = int(time.time()) + self.ALERT_DELAY
         raise ChunkLoopError
 
-    def _parse_cam(self, chunk: str) -> HikvisionCam:
+    def _parse_cam(self, chunk: str) -> HikvisionCam | None:
+        """Return camera for the alert chunk or None if it isn't configured.
+
+        Alerts from NVR channels which are not in the config (or hidden) are
+        skipped instead of breaking and reconnecting the whole NVR alert stream.
+        """
         channel_name = CameraNvrChannelNameDetector.detect_channel_name(chunk)
         if not channel_name:
-            raise RuntimeError(f'Could not find NVR channel name in chunk: "{chunk}"')
-        return self._channel_name_to_cam_map[channel_name]
+            self._log.warning(
+                'Could not find NVR channel name in chunk from "%s": "%s"',
+                self._host,
+                chunk,
+            )
+            return None
+        cam = self._channel_name_to_cam_map.get(channel_name)
+        if cam is None:
+            self._log.debug(
+                'Skip alert from NVR "%s" channel "%s": camera is not configured',
+                self._host,
+                channel_name,
+            )
+        return cam
 
     def _send_alerts(self, cam: HikvisionCam, detection_type: DetectionType) -> None:
         self._log.info(

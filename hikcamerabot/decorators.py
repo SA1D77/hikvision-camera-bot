@@ -2,8 +2,9 @@
 
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from functools import wraps
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from emoji import emojize
 
@@ -54,11 +55,13 @@ log = logging.getLogger(__name__)
 #     return wrapper
 
 
-def authorization_check(func):
+def authorization_check(
+    func: Callable[..., Awaitable[Any]],
+) -> Callable[..., Awaitable[Any]]:
     """User authorization check."""
 
     @wraps(func)
-    async def wrapper(*args, **kwargs):
+    async def wrapper(*args, **kwargs) -> Any:
         bot: CameraBot = args[0]
         message: Message = args[1]
         log.debug(get_user_info(message))
@@ -73,11 +76,13 @@ def authorization_check(func):
     return wrapper
 
 
-def camera_selection(func):
+def camera_selection(
+    func: Callable[..., Awaitable[Any]],
+) -> Callable[..., Awaitable[Any]]:
     """Select camera ID to use."""
 
     @wraps(func)
-    async def wrapper(*args, **kwargs):
+    async def wrapper(*args, **kwargs) -> Any:
         bot: CameraBot = args[0]
         message: Message = args[1]
         cam_id: str = re.findall(CMD_CAM_ID_REGEX, message.text)[0]

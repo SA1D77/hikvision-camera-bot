@@ -43,6 +43,7 @@ class AlarmService(AbstractService):
         self._alert_count: int = 0
 
         self._started: asyncio.Event = asyncio.Event()
+        self._monitoring_task: asyncio.Task | None = None
 
     @property
     def alert_count(self) -> int:
@@ -79,8 +80,11 @@ class AlarmService(AbstractService):
         self._start_service_task()
 
     def _start_service_task(self) -> None:
+        # Quick `alert_off` -> `alert_on` could leave the old task alive (it
+        # checks the state only on the next chunk) and duplicate every alert.
+        self._cancel_service_task()
         task_name = f'{ServiceAlarmMonitoringTask.__name__}_{self.cam.id}'
-        create_task(
+        self._monitoring_task = create_task(
             ServiceAlarmMonitoringTask(service=self).run(),
             task_name=task_name,
             logger=self._log,
@@ -98,6 +102,12 @@ class AlarmService(AbstractService):
         if not self.started:
             raise ServiceRuntimeError('Alarm alert mode already stopped')
         self._started.clear()
+        self._cancel_service_task()
+
+    def _cancel_service_task(self) -> None:
+        if self._monitoring_task and not self._monitoring_task.done():
+            self._monitoring_task.cancel()
+        self._monitoring_task = None
 
     async def alert_stream(self) -> AsyncGenerator[str]:
         """Get Alarm stream from Hikvision Camera."""

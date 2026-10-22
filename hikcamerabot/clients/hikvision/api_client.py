@@ -1,7 +1,7 @@
 """Hikvision camera API client module."""
 
 import logging
-from typing import Any, ClassVar, Final
+from typing import TYPE_CHECKING, Any, ClassVar, Final
 from urllib.parse import urljoin
 
 import httpx
@@ -9,9 +9,12 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 
 from hikcamerabot.clients.hikvision.auth import DigestAuthCached
 from hikcamerabot.clients.hikvision.enums import AuthType, EndpointAddr
-from hikcamerabot.config.schemas.main_config import CamAPISchema
 from hikcamerabot.constants import CONN_TIMEOUT
 from hikcamerabot.exceptions import APIBadResponseCodeError, APIRequestError
+
+if TYPE_CHECKING:
+    # Runtime import causes circular import: config schemas import this package.
+    from hikcamerabot.config.schemas.main_config import CamAPISchema
 
 _RETRY_WAIT: Final[float] = 0.5
 _RETRY_STOP_AFTER_ATTEMPT: Final[int] = 3
@@ -28,7 +31,7 @@ class HikvisionAPIClient:
         AuthType.DIGEST_CACHED: DigestAuthCached,
     }
 
-    def __init__(self, conf: CamAPISchema) -> None:
+    def __init__(self, conf: 'CamAPISchema') -> None:
         self._log = logging.getLogger(self.__class__.__name__)
         self._conf = conf
         self.host = self._conf.host

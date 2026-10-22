@@ -1,5 +1,4 @@
 import asyncio
-import os
 import signal
 import time
 from abc import ABC, abstractmethod
@@ -26,9 +25,10 @@ from hikcamerabot.services.tasks.livestream import (
     FfmpegStdoutReaderTask,
     ServiceStreamerTask,
 )
-from hikcamerabot.utils.process import kill_proc
+from hikcamerabot.utils.process import kill_proc, mask_secrets, start_process
 from hikcamerabot.utils.shared import get_srs_server_ip_address, shallow_sleep_async
 from hikcamerabot.utils.task import create_task
+from hikcamerabot.utils.url import url_credential
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -109,8 +109,8 @@ class AbstractStreamService(AbstractService, ABC):
                 ),
             )
         return FFMPEG_CAM_VIDEO_SRC.format(
-            user=self._hik_user,
-            pw=self._hik_password,
+            user=url_credential(self._hik_user),
+            pw=url_credential(self._hik_password),
             host=urlsplit(self._hik_host).netloc,
             rtsp_port=self.cam.conf.rtsp_port,
             channel=self._stream_conf.channel,
@@ -135,13 +135,14 @@ class AbstractStreamService(AbstractService, ABC):
         )
 
     async def _start_ffmpeg_process(self) -> None:
-        self._log.debug('%s ffmpeg command: "%s"', self._cls_name, self._cmd)
+        self._log.debug(
+            '%s ffmpeg command: "%s"', self._cls_name, mask_secrets(self._cmd)
+        )
         try:
-            self._proc = await asyncio.create_subprocess_shell(
+            self._proc = await start_process(
                 self._cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                preexec_fn=os.setsid,
             )
         except Exception as err:
             err_msg = f'{self._cls_name} failed to start'
@@ -157,7 +158,7 @@ class AbstractStreamService(AbstractService, ABC):
             self._log.warning(warn_msg)
             raise ServiceRuntimeError(warn_msg)
         try:
-            self._log.info('Killing proc "%s"', self._cmd)
+            self._log.info('Killing proc "%s"', mask_secrets(self._cmd))
             await kill_proc(process=self._proc, signal_=signal.SIGINT, reraise=True)
         except ProcessLookupError as err:
             self._log.error('Failed to kill process: %s', err)

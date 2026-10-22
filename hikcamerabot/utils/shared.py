@@ -52,7 +52,8 @@ def gen_random_str(length: int = 4) -> str:
 
 
 def format_ts(ts: float, time_format: str = '%a %b %d %H:%M:%S %Y') -> str:
-    return datetime.fromtimestamp(ts).strftime(time_format)
+    # Server local time (TZ from .env) is intended here.
+    return datetime.fromtimestamp(ts).strftime(time_format)  # noqa: DTZ006
 
 
 def bold(text: str) -> str:

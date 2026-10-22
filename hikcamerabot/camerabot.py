@@ -2,13 +2,16 @@
 
 import asyncio
 import logging
+import time
 
 from pyrogram import Client
+from pyrogram.types import BotCommand
 
 from hikcamerabot.config.config import main_conf
 from hikcamerabot.event_engine.dispatchers.inbound import InboundEventDispatcher
 from hikcamerabot.event_engine.dispatchers.outbound import OutboundEventDispatcher
 from hikcamerabot.event_engine.workers.manager import ResultWorkerManager
+from hikcamerabot.health import HealthWatchdog
 from hikcamerabot.registry import CameraRegistry
 from hikcamerabot.services.alarm.nvr.tasks.alarm_monitoring_task import (
     NvrAlarmMonitoringTask,
@@ -28,6 +31,7 @@ class CameraBot(Client):
         )
         self._log = logging.getLogger(self.__class__.__name__)
         self._log.info('Initializing bot client')
+        self.started_at = time.time()
 
         self.chat_users = main_conf.telegram.chat_users
         self.alert_users = main_conf.telegram.alert_users
@@ -39,10 +43,18 @@ class CameraBot(Client):
         self.result_worker_manager = ResultWorkerManager(self.outbound_dispatcher)
 
     def start_tasks(self) -> None:
-        """Start and forget async launch per camera tasks. They start all
-        enabled services on user cameras like motion detection etc.
+        """Start and forget async launch per camera tasks.
+
+        They start all enabled services on user cameras like motion detection etc.
         """
         self.result_worker_manager.start_worker_tasks()
+        create_task(
+            HealthWatchdog(bot=self).run(),
+            task_name=HealthWatchdog.__name__,
+            logger=self._log,
+            exception_message='Task "%s" raised an exception',
+            exception_message_args=(HealthWatchdog.__name__,),
+        )
         self._start_nvr_services()
         for cam in self.cam_registry.get_instances():
             task_name = f'{cam.id} launch task'
@@ -76,6 +88,21 @@ class CameraBot(Client):
         """That's how we roll."""
         while True:
             await asyncio.sleep(86400)
+
+    async def set_commands_menu(self) -> None:
+        """Show main commands in Telegram "Menu" button near the input field."""
+        commands = [
+            BotCommand('menu', 'Control cameras with buttons'),
+            BotCommand('list_cams', 'List cameras and their commands'),
+            BotCommand('status', 'Bot, storage and cameras status'),
+            BotCommand('groups', 'List camera groups'),
+            BotCommand('help', 'Help'),
+            BotCommand('version', 'Bot version'),
+        ]
+        try:
+            await self.set_bot_commands(commands)
+        except Exception:
+            self._log.exception('Failed to set bot commands menu')
 
     async def send_startup_message(self) -> None:
         """Send welcome message to defined telegram ids after bot launch."""

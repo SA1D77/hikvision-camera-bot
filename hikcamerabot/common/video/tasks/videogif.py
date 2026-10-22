@@ -2,7 +2,6 @@ import asyncio
 import logging
 import signal
 import time
-from datetime import datetime
 from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import urlsplit
 
@@ -26,13 +25,14 @@ from hikcamerabot.event_engine.events.outbound import (
 )
 from hikcamerabot.event_engine.queue import get_result_queue
 from hikcamerabot.utils.file import file_size
-from hikcamerabot.utils.process import kill_proc
+from hikcamerabot.utils.process import kill_proc, mask_secrets, start_process
 from hikcamerabot.utils.shared import (
     bold,
     format_ts,
     gen_random_str,
     get_srs_server_ip_address,
 )
+from hikcamerabot.utils.url import url_credential
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -101,7 +101,7 @@ class RecordVideoGifTask:
             'Recording "%s" video from "%s": "%s"',
             self._video_type.value,
             self._cam.conf.description,
-            self._ffmpeg_cmd,
+            mask_secrets(self._ffmpeg_cmd),
         )
         await self._start_ffmpeg_subprocess()
         if await self._validate_file():
@@ -158,7 +158,7 @@ class RecordVideoGifTask:
 
     async def _start_ffmpeg_subprocess(self) -> None:
         proc_timeout = self._rec_time + self._PROCESS_TIMEOUT
-        proc = await asyncio.create_subprocess_shell(self._ffmpeg_cmd)
+        proc = await start_process(self._ffmpeg_cmd)
         try:
             await asyncio.wait_for(proc.wait(), timeout=proc_timeout)
         except TimeoutError:
@@ -200,7 +200,7 @@ class RecordVideoGifTask:
                 cam=self._cam,
                 message=self._message,
                 file_size=file_size(filepath=self._file_path),
-                create_ts=int(datetime.now().timestamp()),
+                create_ts=int(time.time()),
             )
         )
 
@@ -244,8 +244,8 @@ class RecordVideoGifTask:
             )
         else:
             video_source = FFMPEG_CAM_VIDEO_SRC.format(
-                user=self._cam.conf.api.auth.user,
-                pw=self._cam.conf.api.auth.password,
+                user=url_credential(self._cam.conf.api.auth.user),
+                pw=url_credential(self._cam.conf.api.auth.password),
                 host=urlsplit(self._cam.host).netloc,
                 rtsp_port=self._cam.conf.rtsp_port,
                 channel=self._gif_conf.channel,

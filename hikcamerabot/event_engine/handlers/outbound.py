@@ -101,6 +101,7 @@ class ResultAlertVideoHandler(AbstractResultEventHandler):
 
     def _get_file(self, video_path: Path) -> tuple[str | Path, bool]:
         """Get str file id from cache or `InputFile` from video path.
+
         Indicate whether file is cached or not.
         """
         self._log.debug('Video cache: %s', self._video_file_cache)

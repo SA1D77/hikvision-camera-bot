@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime
+import time
 from io import BytesIO
 from typing import TYPE_CHECKING
 
@@ -165,7 +165,7 @@ class HikvisionCam:
             self._log.error(err_msg)
             raise HikvisionCamError(err_msg) from err
 
-        taken_at = int(datetime.now().timestamp())
+        taken_at = int(time.time())
         self._increase_snapshot_count()
 
         try:

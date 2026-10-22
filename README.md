@@ -2,7 +2,9 @@
 
 Telegram Bot which sends snapshots from your Hikvision cameras.
 
-Version: 2.0. [Release details](releases/release_2.0.md).
+Version: 2.0.1. [Release details](releases/release_2.0.1.md).
+
+> Runs on Raspberry Pi 4/5 (64-bit OS) with Docker. Russian guide: [docs/RASPBERRY_PI_RU.md](docs/RASPBERRY_PI_RU.md).
 
 ## Features
 
@@ -13,6 +15,8 @@ Version: 2.0. [Release details](releases/release_2.0.md).
 5. DVR to local storage with upload to Telegram group.
 6. SRS re-stream server with support of "rewound videos".
 7. Theoretically, Hikvision doorbells also should be supported.
+8. Inline button menu (`/menu`) and bot/host status (`/status`): CPU temperature, RAM, free disk space.
+9. Alerts about low disk space and CPU overheating (useful for Raspberry Pi with SD card).
 
 > Rewound video is a video that starts from the moment of the alert and goes back in time for a specified period.
 > It's useful when you want to see what happened before the alert or during manual request.
@@ -271,6 +275,15 @@ If you want to use the default UTC time format, set Greenwich Mean Time timezone
     # Check whether any containers are running
     sudo docker ps
     ```
+
+3. Update to the latest version (configs are kept as is)
+    ```bash
+    ./update.sh
+    ```
+
+Container logs are rotated (3 files x 10 MB), the bot container has a Docker healthcheck
+(`docker ps` shows `healthy`/`unhealthy`) and on `docker compose stop` ffmpeg processes are
+stopped gracefully, so DVR files are not corrupted.
    
 
 
@@ -279,6 +292,8 @@ If you want to use the default UTC time format, set Greenwich Mean Time timezone
 |----------------------|-------------------------------------------------------------------------------------------------|
 | `/start`             | Start the bot (one-time action during the first start) and show help                            |
 | `/help`              | Show help message                                                                               |
+| `/menu`              | Control cameras with inline buttons: photo, video, alerts, motion detection, infrared           |
+| `/status`            | Show uptime, CPU temperature, RAM, free disk space and running services per camera              |
 | `/list_cams`         | List all your cameras                                                                           |
 | `/cmds_cam_*`        | List commands for particular camera                                                             |
 | `/getpic_cam_*`      | Get resized picture from your Hikvision camera                                                  |

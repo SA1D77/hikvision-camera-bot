@@ -3,13 +3,14 @@ from collections import defaultdict
 from collections.abc import Callable
 
 from pyrogram import filters
-from pyrogram.handlers import MessageHandler
+from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 
 from hikcamerabot.callbacks import cmd_list_group_cams
 from hikcamerabot.camera import HikvisionCam
 from hikcamerabot.camerabot import CameraBot
 from hikcamerabot.commands import setup_commands
 from hikcamerabot.config.config import main_conf
+from hikcamerabot.menu import CALLBACK_PREFIX, on_menu_callback
 from hikcamerabot.utils.shared import build_command_presentation
 
 
@@ -58,6 +59,7 @@ class BotSetup:
 
         self._setup_global_cmds(global_cmds)
         self._setup_group_cmds()
+        self._setup_menu_callbacks()
         self._log.debug('Camera Meta Registry: %r', self._bot.cam_registry)
 
     def _setup_message_handler(self, callback: Callable, cmd: str) -> None:
@@ -72,6 +74,15 @@ class BotSetup:
         """Set up global bot command callbacks (handlers) in place."""
         for cmd, callback in global_cmds.items():
             self._setup_message_handler(callback, cmd)
+
+    def _setup_menu_callbacks(self) -> None:
+        self._bot.add_handler(
+            CallbackQueryHandler(
+                on_menu_callback,
+                filters=filters.user(self._bot.chat_users)
+                & filters.regex(f'^{CALLBACK_PREFIX}\\|'),
+            )
+        )
 
     def _setup_group_cmds(self) -> None:
         for cmd in self._bot.cam_registry.get_groups_registry():

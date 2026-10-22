@@ -36,7 +36,10 @@ log = logging.getLogger(__name__)
 async def cmds(bot: CameraBot, message: Message, cam: HikvisionCam) -> None:
     """Print camera commands."""
     presentation = bot.cam_registry.get_commands_presentation(cam.id)
-    text = f'<b>Available commands</b>\n\n{presentation}\n\n/list_cams, /groups, /help'
+    text = (
+        f'<b>Available commands</b>\n\n{presentation}\n\n'
+        '/menu, /list_cams, /groups, /status, /help'
+    )
     await send_text(text=text, message=message, quote=True)
 
 
@@ -439,6 +442,8 @@ async def cmd_help(
     """Send help message to telegram chat."""
     log.info('Help message has been requested from %d', message.chat.id)
     text = (
+        'Use /menu to control cameras with buttons\n'
+        'Use /status to show bot, storage and cameras status\n'
         'Use /list_cams to show cameras and their commands\n'
         'Use /groups to show camera groups\n'
         'Use /version to check the bot version'

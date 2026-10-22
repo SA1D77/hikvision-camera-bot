@@ -61,7 +61,7 @@ FFMPEG_CMD_VIDEO_GIF: Final[str] = (
     '-i {video_source} '
     '-c:v copy -c:a aac '
     '-t {rec_time} '
-    '{filepath}'
+    '"{filepath}"'
 )
 
 FFMPEG_CMD_HLS_VIDEO_GIF: Final[str] = (
@@ -70,7 +70,7 @@ FFMPEG_CMD_HLS_VIDEO_GIF: Final[str] = (
     '-i {video_source} '
     '-c copy '
     '-t {rec_time} '
-    '{filepath}'
+    '"{filepath}"'
 )
 
 # Livestream constants.
