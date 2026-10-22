@@ -41,7 +41,7 @@ No config changes are needed: existing `config.json`, `livestream_templates.json
 
 ## Docker
 
-1. Base image `python:3.13-alpine3.22` (Alpine 3.20 reached end of life), ffmpeg 7.1.
+1. Base image `python:3.13-alpine3.22` (Alpine 3.20 reached end of life), ffmpeg 6.1 as before.
 2. Docker healthcheck (heartbeat file written by the bot).
 3. `init: true`, `stop_grace_period: 30s`, log rotation (3 x 10 MB) for both containers.
 4. `/tmp` of the bot container is in RAM (`tmpfs`, 512 MB) - video clips are recorded there
