@@ -29,7 +29,9 @@ services:
     command: ["python", "./bot.py"]
     # Time for the bot to stop ffmpeg gracefully, so DVR files are not corrupted.
     stop_grace_period: 30s
-    restart: unless-stopped
+    # Always start after Raspberry Pi reboot, even if the container was stopped
+    # manually before (`unless-stopped` keeps manually stopped containers down).
+    restart: always
     logging: *default-logging
     networks:
       - hik_network
@@ -49,7 +51,7 @@ services:
       - "./srs_prod:/usr/local/srs/user_conf"
     command: >
       bash -c "./objs/srs -c user_conf/hik-docker.conf"
-    restart: unless-stopped
+    restart: always
     logging: *default-logging
     ports:
       # SRS RTMP port. If you comment this out, you won't be able to connect with video player like VLC.
