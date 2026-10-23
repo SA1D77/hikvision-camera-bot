@@ -70,8 +70,8 @@ def setup_commands() -> tuple[dict, dict[list[str] | str, Callable]]:
     }
 
     global_cmds = {
-        'start': cb.cmd_help,
-        'help': cb.cmd_help,
+        'start': menu.cmd_start,
+        'help': menu.cmd_start,
         'menu': menu.cmd_menu,
         'status': menu.cmd_status,
         'stop': cb.cmd_stop,

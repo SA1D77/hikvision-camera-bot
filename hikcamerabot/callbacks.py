@@ -441,11 +441,13 @@ async def cmd_help(
 ) -> None:
     """Send help message to telegram chat."""
     log.info('Help message has been requested from %d', message.chat.id)
-    text = (
-        'Use /menu to control cameras with buttons\n'
-        'Use /status to show bot, storage and cameras status\n'
-        'Use /list_cams to show cameras and their commands\n'
-        'Use /groups to show camera groups\n'
-        'Use /version to check the bot version'
-    )
-    await send_text(text=text, message=message, quote=True)
+    await send_text(text=HELP_TEXT, message=message, quote=True)
+
+
+HELP_TEXT = (
+    'Use /menu or "📋 Меню" button to control cameras with buttons\n'
+    'Use /status to show bot, storage and cameras status\n'
+    'Use /list_cams to show cameras and their commands\n'
+    'Use /groups to show camera groups\n'
+    'Use /version to check the bot version'
+)

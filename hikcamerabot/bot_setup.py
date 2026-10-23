@@ -1,4 +1,5 @@
 import logging
+import re
 from collections import defaultdict
 from collections.abc import Callable
 
@@ -10,7 +11,12 @@ from hikcamerabot.camera import HikvisionCam
 from hikcamerabot.camerabot import CameraBot
 from hikcamerabot.commands import setup_commands
 from hikcamerabot.config.config import main_conf
-from hikcamerabot.menu import CALLBACK_PREFIX, on_menu_callback
+from hikcamerabot.menu import (
+    CALLBACK_PREFIX,
+    MENU_BUTTON_TEXT,
+    cmd_menu,
+    on_menu_callback,
+)
 from hikcamerabot.utils.shared import build_command_presentation
 
 
@@ -76,6 +82,13 @@ class BotSetup:
             self._setup_message_handler(callback, cmd)
 
     def _setup_menu_callbacks(self) -> None:
+        self._bot.add_handler(
+            MessageHandler(
+                cmd_menu,
+                filters=filters.user(self._bot.chat_users)
+                & filters.regex(f'^{re.escape(MENU_BUTTON_TEXT)}$'),
+            )
+        )
         self._bot.add_handler(
             CallbackQueryHandler(
                 on_menu_callback,
