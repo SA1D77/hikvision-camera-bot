@@ -131,6 +131,8 @@ class DetectionSchema(StrictBaseModel):
 
 
 class AlertSchema(StrictBaseModel):
+    # Start alert service on bot startup. Toggled from the bot menu.
+    enabled: bool = True
     delay: IntMin0
     motion_detection: DetectionSchema
     line_crossing_detection: DetectionSchema

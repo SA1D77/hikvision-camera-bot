@@ -58,9 +58,18 @@ class AlarmService(AbstractService):
         return self._started.is_set()
 
     @property
+    def conf(self) -> AlertSchema:
+        return self._conf
+
+    def update_conf(self, conf: AlertSchema) -> None:
+        """Apply alert settings changed from the bot menu without restart."""
+        self._conf = conf
+        self.alert_delay = conf.delay
+
+    @property
     def enabled_in_conf(self) -> bool:
-        """Check if any alarm trigger is enabled in conf."""
-        return any(
+        """Check if alarm is enabled and any alarm trigger is enabled in conf."""
+        return self._conf.enabled and any(
             self._conf.get_detection_schema_by_type(type_=trigger).enabled
             for trigger in self.ALARM_TRIGGERS
         )
