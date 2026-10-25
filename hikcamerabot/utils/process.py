@@ -17,6 +17,16 @@ _KILL_WAIT_TIMEOUT: Final[float] = 10.0
 _URL_CREDENTIALS_REGEX: Final[re.Pattern[str]] = re.compile(
     r'(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<user>[^:@/\s"\']*):[^@\s"\']*@'
 )
+# `rtmps://dc4-1.rtmp.t.me/s/KEY` -> `rtmps://dc4-1.rtmp.t.me/s/***`.
+# Stream keys of external services (Telegram, YouTube) are the last path part.
+# Local SRS URLs (IP address or SRS container name) are kept for debugging.
+_STREAM_KEY_REGEX: Final[re.Pattern[str]] = re.compile(
+    r'(?P<prefix>rtmps?://(?P<host>[^/\s"\':]+)(?::\d+)?/(?:[^\s"\']*/)?)'
+    r'(?P<key>[^/\s"\']+)'
+)
+_LOCAL_STREAM_HOSTS: Final[frozenset[str]] = frozenset(
+    ('localhost', 'hikvision_srs_server')
+)
 # `-password "secret"` -> `-password "***"`
 _PASSWORD_ARG_REGEX: Final[re.Pattern[str]] = re.compile(
     r'(?P<arg>-password\s+)(?:"[^"]*"|\'[^\']*\'|\S+)'
@@ -30,7 +40,15 @@ _RUNNING_PROCESSES: set[Process] = set()
 def mask_secrets(text: str) -> str:
     """Hide credentials in commands/URLs before writing them to logs."""
     text = _URL_CREDENTIALS_REGEX.sub(r'\g<scheme>\g<user>:***@', text)
+    text = _STREAM_KEY_REGEX.sub(_mask_stream_key, text)
     return _PASSWORD_ARG_REGEX.sub(r'\g<arg>"***"', text)
+
+
+def _mask_stream_key(match: re.Match[str]) -> str:
+    host = match['host']
+    if host in _LOCAL_STREAM_HOSTS or host.replace('.', '').isdigit():
+        return match[0]
+    return f'{match["prefix"]}***'
 
 
 async def start_process(cmd: str, **kwargs: Any) -> Process:

@@ -89,6 +89,25 @@ def test_mask_secrets_hides_icecast_password():
     assert '-password "***"' in masked
 
 
+def test_mask_secrets_hides_stream_keys():
+    masked = mask_secrets(
+        'ffmpeg -f flv "rtmps://dc4-1.rtmp.t.me/s/123456:SecretKey" '
+        'rtmp://a.rtmp.youtube.com/live2/abcd-efgh-ijkl'
+    )
+    assert 'SecretKey' not in masked
+    assert 'abcd-efgh' not in masked
+    assert '"rtmps://dc4-1.rtmp.t.me/s/***"' in masked
+    assert 'rtmp://a.rtmp.youtube.com/live2/***' in masked
+
+
+def test_mask_secrets_keeps_local_srs_urls():
+    text = (
+        'rtmp://172.18.0.3/live/livestream_101_cam_1 '
+        'rtmp://hikvision_srs_server/live/livestream_101_cam_2'
+    )
+    assert mask_secrets(text) == text
+
+
 def test_mask_secrets_keeps_text_without_secrets():
     text = 'ffmpeg -i rtmp://127.0.0.1/live/livestream_101_cam_1 -c copy out.mp4'
     assert mask_secrets(text) == text

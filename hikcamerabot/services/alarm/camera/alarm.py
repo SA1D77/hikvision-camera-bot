@@ -93,9 +93,25 @@ class AlarmService(AbstractService):
         )
 
     async def _enable_triggers_on_camera(self) -> None:
+        """Enable triggers which are enabled in config.
+
+        Some (old) cameras don't support e.g. Line Crossing Detection and return
+        an error. Then just warn and keep monitoring the alert stream: other
+        detections (or ones enabled manually in camera web UI) still work.
+        """
         for trigger in self.ALARM_TRIGGERS:
-            if self._conf.get_detection_schema_by_type(type_=trigger).enabled:
+            if not self._conf.get_detection_schema_by_type(type_=trigger).enabled:
+                continue
+            try:
                 await self.trigger_switch(trigger=DetectionType(trigger), state=True)
+            except ServiceRuntimeError as err:
+                self._log.warning(
+                    '[%s] %s. Is it supported by the camera and is the user allowed '
+                    'to change it? Configure it in camera web UI or set '
+                    '"enabled": false for it in config to hide this warning',
+                    self.cam.id,
+                    err,
+                )
 
     async def stop(self) -> None:
         """Disable alarm."""
