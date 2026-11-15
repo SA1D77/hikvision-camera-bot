@@ -418,6 +418,14 @@ class ArchiveService:
         if sent:
             note = '' if sent == len(parts) else f' Отправлено {sent} из {len(parts)}.'
             await self._set_status(job, f'✅ Готово.{note}', final=True)
+        elif job.stream is StreamType.SUB:
+            await self._set_status(
+                job,
+                '🛑 Не удалось выгрузить доп. поток. Похоже, этот регистратор '
+                'пишет в архив только основной поток — запросите запись ещё раз '
+                'и нажмите «▶️ Выгрузить».',
+                final=True,
+            )
         else:
             await self._set_status(
                 job,

@@ -17,10 +17,15 @@ from hikcamerabot.utils.process import kill_proc, mask_secrets, start_process
 _FFMPEG_CMD_TPL: Final[str] = (
     f'{FFMPEG_BIN} -y -loglevel error -rtsp_transport tcp '
     '-i "{url}" '
-    '-map 0:v:0 -map 0:a? -c:v copy -c:a aac '
+    '-map 0:v:0 {audio} -c:v copy '
     '-t {duration} -movflags +faststart '
     '"{file_path}"'
 )
+_AUDIO_ARGS: Final[str] = '-map 0:a? -c:a aac'
+# Some cameras send audio which ffmpeg can't decode: then video only.
+_NO_AUDIO_ARGS: Final[str] = '-an'
+# NVR refused the playback itself: a try without audio won't help.
+_SERVER_ERROR_MARK: Final[str] = 'Server returned'
 
 _POLL_PERIOD: Final[float] = 5.0
 # NVR sends nothing: no recording for this time or the connection is stuck.
@@ -34,10 +39,20 @@ class ArchiveExportError(Exception):
     """ffmpeg failed to record the archive part."""
 
 
-def build_export_cmd(url: str, file_path: Path, duration: int) -> str:
+def build_export_cmd(
+    url: str, file_path: Path, duration: int, audio: bool = True
+) -> str:
     return _FFMPEG_CMD_TPL.format(
-        url=url, duration=duration, file_path=file_path.as_posix()
+        url=url,
+        duration=duration,
+        file_path=file_path.as_posix(),
+        audio=_AUDIO_ARGS if audio else _NO_AUDIO_ARGS,
     )
+
+
+def _track_key(url: str) -> str:
+    """Return playback URL without the period: the same for all parts of a camera."""
+    return url.split('?', maxsplit=1)[0]
 
 
 def split_period(
@@ -65,6 +80,8 @@ class ArchiveExporter:
 
     def __init__(self) -> None:
         self._log = logging.getLogger(self.__class__.__name__)
+        # Cameras whose audio can't be converted: exported without it at once.
+        self._no_audio_tracks: set[str] = set()
 
     async def export(
         self,
@@ -76,9 +93,33 @@ class ArchiveExporter:
         """Record `duration` seconds from playback `url` to `file_path`.
 
         Raise `ArchiveExportError` if nothing was recorded. The process is
-        stopped when the task is cancelled.
+        stopped when the task is cancelled. If the export with audio fails,
+        it's repeated without audio.
         """
-        cmd = build_export_cmd(url=url, file_path=file_path, duration=duration)
+        track = _track_key(url)
+        if track not in self._no_audio_tracks:
+            try:
+                await self._export(url, file_path, duration, on_progress, audio=True)
+            except ArchiveExportError as err:
+                if _SERVER_ERROR_MARK in str(err):
+                    raise
+                self._log.warning('Export with audio failed, trying without: %s', err)
+            else:
+                return
+        await self._export(url, file_path, duration, on_progress, audio=False)
+        self._no_audio_tracks.add(track)
+
+    async def _export(
+        self,
+        url: str,
+        file_path: Path,
+        duration: int,
+        on_progress: ProgressCallback | None,
+        audio: bool,
+    ) -> None:
+        cmd = build_export_cmd(
+            url=url, file_path=file_path, duration=duration, audio=audio
+        )
         self._log.info('Exporting archive: %s', mask_secrets(cmd))
         proc = await start_process(
             cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE

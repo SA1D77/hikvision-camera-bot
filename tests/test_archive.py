@@ -1051,3 +1051,58 @@ async def test_region_with_one_nvr_opens_it_at_once(tmp_path):
         for btn in row
     }
     assert labels['⬅️ Регионы'] == 'arc|s'
+
+
+# Export without audio which ffmpeg can't convert.
+
+
+def test_export_cmd_without_audio(tmp_path):
+    cmd = build_export_cmd('rtsp://nvr/x', tmp_path / 'a.mp4', 60, audio=False)
+    args = shlex.split(cmd)
+    assert '-an' in args
+    assert '-c:a' not in args
+    assert '0:a?' not in args
+
+
+async def test_export_is_repeated_without_audio(tmp_path):
+    from hikcamerabot.archive.exporter import ArchiveExporter, ArchiveExportError
+
+    exporter = ArchiveExporter()
+    calls = []
+
+    async def fake(url, file_path, duration, on_progress, audio):
+        calls.append(audio)
+        if audio:
+            raise ArchiveExportError('no decoder found for: none')
+
+    exporter._export = fake
+    url = 'rtsp://nvr/Streaming/tracks/201?starttime=1'
+    await exporter.export(url, tmp_path / 'a.mp4', 60)
+    assert calls == [True, False]
+    # The next part of the same camera goes without audio at once.
+    await exporter.export(url.replace('=1', '=2'), tmp_path / 'b.mp4', 60)
+    assert calls == [True, False, False]
+
+
+async def test_export_refused_by_nvr_is_not_repeated(tmp_path):
+    from hikcamerabot.archive.exporter import ArchiveExporter, ArchiveExportError
+
+    exporter = ArchiveExporter()
+    exporter._export = AsyncMock(
+        side_effect=ArchiveExportError('Server returned 400 Bad Request')
+    )
+    with pytest.raises(ArchiveExportError):
+        await exporter.export('rtsp://nvr/t/102?a=1', tmp_path / 'a.mp4', 60)
+    assert exporter._export.await_count == 1
+
+
+@requires_config
+async def test_failed_sub_stream_job_advises_main_stream(tmp_path):
+    from hikcamerabot.archive.exporter import ArchiveExportError
+
+    bot = _bot()
+    service = _service(tmp_path, bot)
+    service.find_recordings = AsyncMock(return_value=[_recording()])
+    service._exporter.export = AsyncMock(side_effect=ArchiveExportError('400'))
+    await service._run_job(_job(stream=StreamType.SUB))
+    assert 'только основной поток' in _last_status(bot)
