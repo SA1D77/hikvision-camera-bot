@@ -48,6 +48,29 @@ def covered_seconds(spans: list[tuple[datetime, datetime]]) -> float:
     )
 
 
+def hour_coverage(recordings: list[Recording], day_start: datetime) -> list[float]:
+    """Return recorded seconds of each of 24 hours of the day."""
+    result = []
+    for hour in range(24):
+        start = day_start + timedelta(hours=hour)
+        end = start + timedelta(hours=1)
+        result.append(covered_seconds(covered_spans(recordings, start, end)))
+    return result
+
+
+def join_close_spans(
+    spans: list[tuple[datetime, datetime]], gap: timedelta
+) -> list[tuple[datetime, datetime]]:
+    """Join spans with small gaps: motion recordings are many short files."""
+    joined: list[tuple[datetime, datetime]] = []
+    for span_start, span_end in spans:
+        if joined and span_start - joined[-1][1] <= gap:
+            joined[-1] = (joined[-1][0], max(joined[-1][1], span_end))
+        else:
+            joined.append((span_start, span_end))
+    return joined
+
+
 def is_fully_covered(
     spans: list[tuple[datetime, datetime]], start: datetime, end: datetime
 ) -> bool:

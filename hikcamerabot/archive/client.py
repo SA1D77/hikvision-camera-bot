@@ -39,6 +39,11 @@ _PLAYBACK_URI_SIZE_REGEX: Final[re.Pattern[str]] = re.compile(r'[?&]size=(\d+)')
 _CHANNELS_CACHE_TTL: Final[float] = 600.0
 _SEARCH_TIMEOUT: Final[float] = 30.0
 _SEARCH_MAX_RESULTS: Final[int] = 50
+# A camera recorded by motion has hundreds of short files a day.
+_SEARCH_MAX_TOTAL: Final[int] = 3000
+_MORE_RESULTS_REGEX: Final[re.Pattern[str]] = re.compile(
+    r'<responseStatusStrg>\s*MORE', re.IGNORECASE
+)
 # How far back the oldest recording is searched.
 _OLDEST_SEARCH_DAYS: Final[int] = 3650
 _RECENT_HOURS: Final[int] = 24
@@ -62,7 +67,7 @@ _SEARCH_XML_TPL: Final[str] = (
     '<startTime>{start}</startTime><endTime>{end}</endTime>'
     '</timeSpan></timeSpanList>'
     '<maxResults>{max_results}</maxResults>'
-    '<searchResultPostion>0</searchResultPostion>'
+    '<searchResultPostion>{position}</searchResultPostion>'
     '<metadataList>'
     '<metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>'
     '</metadataList>'
@@ -322,23 +327,39 @@ class NvrArchiveClient:
         start: datetime,
         end: datetime,
         stream: StreamType,
-        max_results: int = _SEARCH_MAX_RESULTS,
+        max_results: int | None = None,
     ) -> list[Recording]:
-        """Return recordings of the period. Empty list - no recordings."""
-        payload = _SEARCH_XML_TPL.format(
-            search_id=str(uuid4()).upper(),
-            track_id=track_id(channel, stream),
-            start=start.strftime(_ISAPI_TIME_FORMAT),
-            end=end.strftime(_ISAPI_TIME_FORMAT),
-            max_results=max_results,
-        )
-        text = await self._request(
-            'POST', _SEARCH_ENDPOINT, data=payload, timeout=_SEARCH_TIMEOUT
-        )
-        try:
-            recordings = parse_search_result(text)
-        except Exception as err:
-            raise HikvisionAPIError(f'Unexpected search response: {err}') from err
+        """Return recordings of the period. Empty list - no recordings.
+
+        All pages of the result are read unless `max_results` is given.
+        """
+        search_id = str(uuid4()).upper()
+        recordings: list[Recording] = []
+        while True:
+            payload = _SEARCH_XML_TPL.format(
+                search_id=search_id,
+                track_id=track_id(channel, stream),
+                start=start.strftime(_ISAPI_TIME_FORMAT),
+                end=end.strftime(_ISAPI_TIME_FORMAT),
+                max_results=max_results or _SEARCH_MAX_RESULTS,
+                position=len(recordings),
+            )
+            text = await self._request(
+                'POST', _SEARCH_ENDPOINT, data=payload, timeout=_SEARCH_TIMEOUT
+            )
+            try:
+                page = parse_search_result(text)
+            except Exception as err:
+                raise HikvisionAPIError(f'Unexpected search response: {err}') from err
+            recordings.extend(page)
+            # A given `max_results` means one request, otherwise all pages.
+            if (
+                max_results is not None
+                or not page
+                or not _MORE_RESULTS_REGEX.search(text)
+                or len(recordings) >= _SEARCH_MAX_TOTAL
+            ):
+                break
         if not recordings:
             # Helps to find out why NVR tells there are no recordings.
             self._log.info(
@@ -348,7 +369,7 @@ class NvrArchiveClient:
                 end.strftime(_ISAPI_TIME_FORMAT),
                 ' '.join(text.split())[:_LOGGED_RESPONSE_SIZE],
             )
-        return recordings
+        return sorted(recordings, key=lambda rec: rec.start)
 
     def playback_url(
         self, channel: int, start: datetime, end: datetime, stream: StreamType

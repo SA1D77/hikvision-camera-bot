@@ -10,6 +10,7 @@ All button state is kept in callback data, so it survives bot restarts.
 import contextlib
 import logging
 from datetime import date, datetime, timedelta
+from datetime import time as dt_time
 from io import BytesIO
 from typing import TYPE_CHECKING, Final
 
@@ -24,6 +25,12 @@ from pyrogram.types import (
 )
 
 from hikcamerabot.archive.client import StreamType
+from hikcamerabot.archive.recordings import (
+    covered_seconds,
+    covered_spans,
+    hour_coverage,
+    join_close_spans,
+)
 from hikcamerabot.archive.service import (
     STREAM_NAMES,
     ArchiveJob,
@@ -36,6 +43,7 @@ from hikcamerabot.archive.timeparse import (
     DAY_AND_TIME_HINT,
     TIME_RANGE_HINT,
     ArchiveInputError,
+    parse_day,
     parse_day_and_time_range,
     parse_request,
 )
@@ -61,6 +69,8 @@ _ACTION_GO: Final[str] = 'g'
 _ACTION_CLOSE: Final[str] = 'x'
 _ACTION_CANCEL_JOB: Final[str] = 'k'
 _ACTION_DEPTH: Final[str] = 'h'
+_ACTION_HOUR: Final[str] = 't'
+_ACTION_NO_RECORD: Final[str] = 'z'
 
 NVRS_PER_PAGE: Final[int] = 10
 CHANNELS_PER_PAGE: Final[int] = 10
@@ -70,6 +80,13 @@ DAYS_TO_SHOW: Final[int] = 7
 _NO_GROUP_TITLE: Final[str] = 'Без региона'
 
 _DAY_KEY_FORMAT: Final[str] = '%Y%m%d'
+_HOUR_KEY_FORMAT: Final[str] = '%Y%m%d%H'
+_HOURS_IN_ROW: Final[int] = 6
+# An hour is shown as fully recorded from this number of seconds.
+_FULL_HOUR_SECONDS: Final[int] = 55 * 60
+_TIMELINE_SPANS_SHOWN: Final[int] = 16
+_TIMELINE_JOIN_GAP: Final[timedelta] = timedelta(minutes=1)
+_HOUR_FULL, _HOUR_PART, _HOUR_EMPTY = '🟩', '🟨', '⬜'
 _START_KEY_FORMAT: Final[str] = '%Y%m%d%H%M'
 _WEEKDAYS: Final[tuple[str, ...]] = ('пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс')
 _STREAM_CODES: Final[dict[str, StreamType]] = {
@@ -82,7 +99,8 @@ HELP_TEXT: Final[str] = (
     'Кнопка «🎞 Архив» или /archive: выберите регистратор и камеру — бот '
     'пришлёт кадр с неё, чтобы проверить ракурс. Затем «Выгрузить запись», '
     'день и время, например <code>13:30-14:00</code>. Бот проверит, есть ли '
-    'запись, и пришлёт видео; длинные записи приходят по частям.\n'
+    'запись, и пришлёт видео; длинные записи приходят по частям. После выбора '
+    'дня видно по часам, когда шла запись: нажмите на час, чтобы выгрузить его.\n'
     'Быстро одной командой: <code>/archive 26 13:30-14:00</code>.\n'
     'Кнопка «💾 Глубина архива» в списке камер показывает, за сколько дней '
     'на регистраторе хранится запись.'
@@ -229,8 +247,12 @@ def build_preview_keyboard(nvr_idx: int, channel: int) -> InlineKeyboardMarkup:
 
 
 def build_days_keyboard(
-    nvr_idx: int, channel: int, today: date
+    nvr_idx: int,
+    channel: int,
+    today: date,
+    marks: dict[date, bool] | None = None,
 ) -> InlineKeyboardMarkup:
+    """Days to choose. `marks` tell which days have recordings."""
     buttons = []
     for days_ago in range(DAYS_TO_SHOW):
         day = today - timedelta(days=days_ago)
@@ -240,6 +262,8 @@ def build_days_keyboard(
             text = 'Вчера'
         else:
             text = f'{day.strftime("%d.%m")} {_WEEKDAYS[day.weekday()]}'
+        if marks and day in marks:
+            text += ' ✅' if marks[day] else ' ❌'
         buttons.append(
             _btn(text, _ACTION_DAY, nvr_idx, channel, day.strftime(_DAY_KEY_FORMAT))
         )
@@ -247,6 +271,38 @@ def build_days_keyboard(
     rows.append([_btn('📅 Другая дата', _ACTION_DAY, nvr_idx, channel, _OTHER_DAY_KEY)])
     rows.append([_btn('⬅️ Камеры', _ACTION_NVR, nvr_idx, 0), _close_btn()])
     return InlineKeyboardMarkup([row for row in rows if row])
+
+
+def build_hours_keyboard(
+    nvr_idx: int, channel: int, day: date, seconds_by_hour: list[float], now: datetime
+) -> InlineKeyboardMarkup:
+    """24 hours of the day: a press asks to export the hour."""
+    buttons = []
+    for hour, seconds in enumerate(seconds_by_hour):
+        start = datetime.combine(day, dt_time(hour))
+        if start >= now:
+            break
+        if seconds >= _FULL_HOUR_SECONDS:
+            mark = _HOUR_FULL
+        elif seconds > 0:
+            mark = _HOUR_PART
+        else:
+            mark = _HOUR_EMPTY
+        action = _ACTION_HOUR if seconds > 0 else _ACTION_NO_RECORD
+        buttons.append(
+            _btn(
+                f'{hour:02d} {mark}',
+                action,
+                nvr_idx,
+                channel,
+                start.strftime(_HOUR_KEY_FORMAT),
+            )
+        )
+    rows = [
+        buttons[i : i + _HOURS_IN_ROW] for i in range(0, len(buttons), _HOURS_IN_ROW)
+    ]
+    rows.append([_btn('⬅️ Дни', _ACTION_EXPORT, nvr_idx, channel), _close_btn()])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_confirm_keyboard(
@@ -364,6 +420,66 @@ async def _nvr_step(
         f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}\n'
         f'Камер: {len(channels)}. Выберите камеру — пришлю кадр с неё.',
         build_channels_keyboard(channels, nvr_idx, page, back),
+    )
+
+
+async def _day_step(
+    service: ArchiveService, nvr_idx: int, channel: int, day: date, header: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Show when the camera was recorded during the day, hour by hour."""
+    nvr_id = service.nvr_ids[nvr_idx]
+    now = datetime.now()  # noqa: DTZ005
+    day_start = datetime.combine(day, dt_time.min)
+    day_end = day_start + timedelta(days=1)
+    title = f'{header}\n🗓 {day.strftime("%d.%m.%Y")}, {_WEEKDAYS[day.weekday()]}'
+    type_hint = (
+        f'отправьте время сообщением. {TIME_RANGE_HINT}\n'
+        f'Максимум за один раз — {format_minutes(service.max_duration)}.'
+    )
+    back = InlineKeyboardMarkup(
+        [[_btn('⬅️ Дни', _ACTION_EXPORT, nvr_idx, channel), _close_btn()]]
+    )
+    try:
+        recordings = await service.find_recordings(
+            nvr_id, channel, day_start, day_end, StreamType.MAIN
+        )
+    except Exception as err:
+        log.warning('Failed to get recordings of the day on "%s": %s', nvr_id, err)
+        return (
+            f'{title}\n\nНе удалось узнать, когда шла запись.\n'
+            f'{describe_error(err)}\n\nМожно {type_hint}',
+            back,
+        )
+    if recordings is None:
+        return (
+            f'{title}\n\nРегистратор не сообщает, когда шла запись.\n'
+            f'Чтобы выгрузить, {type_hint}',
+            back,
+        )
+
+    spans = covered_spans(recordings, day_start, min(day_end, now))
+    if not spans:
+        day_info = await service.describe_day(nvr_id, channel, day_start)
+        return (
+            f'{title}\n\n🤷 {day_info}\n\nВыберите другой день или {type_hint}',
+            back,
+        )
+
+    shown = join_close_spans(spans, _TIMELINE_JOIN_GAP)
+    spans_text = ', '.join(
+        format_period(span_start, span_end).split(' ', maxsplit=1)[1]
+        for span_start, span_end in shown[:_TIMELINE_SPANS_SHOWN]
+    )
+    if len(shown) > _TIMELINE_SPANS_SHOWN:
+        spans_text += f' и ещё {len(shown) - _TIMELINE_SPANS_SHOWN}'
+    recorded = format_minutes(timedelta(seconds=covered_seconds(spans)))
+    return (
+        f'{title}\n\n🎞 Запись есть: {recorded}\n{spans_text}\n\n'
+        f'{_HOUR_FULL} весь час · {_HOUR_PART} частично · {_HOUR_EMPTY} нет записи\n'
+        f'Нажмите на час или {type_hint}',
+        build_hours_keyboard(
+            nvr_idx, channel, day, hour_coverage(recordings, day_start), now
+        ),
     )
 
 
@@ -531,11 +647,30 @@ async def on_time_range_text(bot: 'CameraBot', message: Message) -> None:
     if pending is None or not _is_allowed(bot, user_id, chat_id):
         return
     nvr_idx, channel, day = pending
+    today = datetime.now().date()  # noqa: DTZ005
+    words = (message.text or '').split()
+    if len(words) == 1:
+        try:
+            typed_day = parse_day(words[0], today)
+        except ArchiveInputError:
+            pass
+        else:
+            # A date alone: show when the camera was recorded that day.
+            service: ArchiveService = bot.archive
+            nvr_id = service.nvr_ids[nvr_idx]
+            _pending[chat_id] = (nvr_idx, channel, typed_day)
+            title = _camera_title(
+                channel, await _channel_name(service, nvr_id, channel)
+            )
+            header = f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}, {title}'
+            text, markup = await _day_step(service, nvr_idx, channel, typed_day, header)
+            await message.reply_text(text, reply_markup=markup, quote=True)
+            return
     try:
         start, end = parse_day_and_time_range(
             message.text or '',
             day,
-            today=datetime.now().date(),  # noqa: DTZ005
+            today=today,
         )
     except ArchiveInputError as err:
         await message.reply_text(
@@ -645,13 +780,36 @@ async def _process_action(  # noqa: C901, PLR0911, PLR0912, PLR0915
 
     if action == _ACTION_EXPORT:
         await query.answer()
+        today = datetime.now().date()  # noqa: DTZ005
         # The camera picture stays in the chat above the dialog.
         await _show(
             bot,
             message,
-            f'{header}\nЗа какой день нужна запись?',
-            build_days_keyboard(nvr_idx, channel, datetime.now().date()),  # noqa: DTZ005
+            f'{header}\nЗа какой день нужна запись?\n'
+            '✅ — запись за день есть, ❌ — нет.',
+            build_days_keyboard(
+                nvr_idx,
+                channel,
+                today,
+                await service.days_with_recordings(
+                    nvr_id,
+                    channel,
+                    [today - timedelta(days=ago) for ago in range(DAYS_TO_SHOW)],
+                ),
+            ),
             keep_photo=True,
+        )
+        return
+
+    if action == _ACTION_NO_RECORD:
+        await query.answer('За этот час записи нет', show_alert=True)
+        return
+
+    if action == _ACTION_HOUR:
+        start = datetime.strptime(args[2], _HOUR_KEY_FORMAT)  # noqa: DTZ007
+        await query.answer()
+        await _send_confirmation(
+            bot, message, nvr_idx, channel, start, start + timedelta(hours=1)
         )
         return
 
@@ -663,16 +821,17 @@ async def _process_action(  # noqa: C901, PLR0911, PLR0912, PLR0915
         )
         _pending[chat_id] = (nvr_idx, channel, day)
         await query.answer()
-        ask = (
-            f'🗓 {day.strftime("%d.%m.%Y")}\n\n'
-            f'Теперь отправьте время сообщением. {TIME_RANGE_HINT}'
-            if day
-            else f'Любая дата, пока запись хранится на регистраторе.\n{DAY_AND_TIME_HINT}'
-        )
+        if day:
+            await _show(
+                bot, message, *await _day_step(service, nvr_idx, channel, day, header)
+            )
+            return
         await _show(
             bot,
             message,
-            f'{header}\n{ask}\n'
+            f'{header}\nЛюбая дата, пока запись хранится на регистраторе.\n'
+            'Отправьте дату, например <code>13.10</code>, — покажу, когда в этот '
+            f'день шла запись.\nИли сразу дату и время. {DAY_AND_TIME_HINT}\n'
             f'Максимум за один раз — {format_minutes(service.max_duration)}.',
             InlineKeyboardMarkup(
                 [[_btn('⬅️ Назад', _ACTION_EXPORT, nvr_idx, channel), _close_btn()]]

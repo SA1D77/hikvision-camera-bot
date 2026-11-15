@@ -6,7 +6,8 @@ import logging
 import shutil
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -59,6 +60,7 @@ _DEPTH_CONCURRENCY: Final[int] = 4
 _DEPTH_NAME_MAX_LEN: Final[int] = 22
 _DEPTH_MAX_LINES: Final[int] = 70
 _DAY_SPANS_SHOWN: Final[int] = 12
+_DAYS_CHECK_TIMEOUT: Final[float] = 12.0
 _CLOCK_MAX_DIFF: Final[timedelta] = timedelta(minutes=5)
 
 STREAM_NAMES: Final[dict[StreamType, str]] = {
@@ -308,6 +310,38 @@ class ArchiveService:
                 *(check(channel, name) for channel, name in channels.items())
             )
         )
+
+    async def days_with_recordings(
+        self, nvr_id: str, channel: int, days: list[date]
+    ) -> dict[date, bool]:
+        """Tell which of the days have recordings. Empty dict if NVR can't tell."""
+        client = self._clients[nvr_id]
+
+        async def check(day: date) -> bool:
+            day_start = datetime.combine(day, dt_time.min)
+            return bool(
+                await client.find_recordings(
+                    channel,
+                    day_start,
+                    day_start + timedelta(days=1),
+                    StreamType.MAIN,
+                    max_results=1,
+                )
+            )
+
+        try:
+            found = await asyncio.wait_for(
+                asyncio.gather(*(check(day) for day in days)), _DAYS_CHECK_TIMEOUT
+            )
+        except Exception as err:
+            self._log.warning(
+                'Failed to check days with recordings on "%s": %s: %s',
+                nvr_id,
+                err.__class__.__name__,
+                err,
+            )
+            return {}
+        return dict(zip(days, found, strict=True))
 
     async def describe_day(self, nvr_id: str, channel: int, day: datetime) -> str:
         """Tell when the camera was recorded during the day of `day`.

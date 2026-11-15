@@ -858,6 +858,7 @@ async def test_camera_button_sends_picture_with_export_button(tmp_path):
     query.message.delete.assert_awaited_once()
 
     # "Export" pressed under the picture: the picture stays, days are asked.
+    service.days_with_recordings = AsyncMock(return_value={})
     photo_query = _query('arc|e|0|27')
     photo_query.message.photo = object()
     await handlers.on_archive_callback(bot, photo_query)
@@ -1155,6 +1156,21 @@ async def test_other_date_button_waits_for_date_and_time(tmp_path, monkeypatch):
     assert handlers._pending == {1: (0, 27, None)}
     assert 'дату и время' in query.message.edit_text.await_args.args[0]
 
+    # A date alone shows the day, the bot keeps waiting for a time.
+    service.find_recordings = AsyncMock(
+        return_value=[
+            Recording(datetime(2026, 10, 13, 9, 0), datetime(2026, 10, 13, 9, 30))
+        ]
+    )
+    message = MagicMock()
+    message.chat = SimpleNamespace(id=1)
+    message.from_user = SimpleNamespace(id=1)
+    message.text = '13.10.2026'
+    message.reply_text = AsyncMock()
+    await handlers.on_time_range_text(bot, message)
+    assert handlers._pending == {1: (0, 27, date(2026, 10, 13))}
+    assert 'Запись есть: 30 мин' in message.reply_text.await_args.args[0]
+
 
 @requires_config
 async def test_describe_day_lists_recorded_time(tmp_path):
@@ -1220,3 +1236,141 @@ async def test_client_time(tmp_path):
     )
     client = _client(tmp_path, lambda _: httpx.Response(200, text=xml))
     assert await client.get_time() == datetime(2026, 11, 15, 18, 53)
+
+
+# Recordings of a day by hours.
+
+
+def test_hour_coverage_and_joined_spans():
+    from hikcamerabot.archive.recordings import hour_coverage, join_close_spans
+
+    day = datetime(2026, 11, 13)
+    recordings = [
+        Recording(datetime(2026, 11, 13, 8, 50), datetime(2026, 11, 13, 10, 0)),
+        Recording(datetime(2026, 11, 13, 14, 0), datetime(2026, 11, 13, 14, 5)),
+    ]
+    hours = hour_coverage(recordings, day)
+    assert len(hours) == 24
+    assert hours[8] == 600
+    assert hours[9] == 3600
+    assert hours[14] == 300
+    assert sum(hours) == 600 + 3600 + 300
+
+    spans = [
+        (datetime(2026, 11, 13, 9, 0), datetime(2026, 11, 13, 9, 1)),
+        (datetime(2026, 11, 13, 9, 1, 30), datetime(2026, 11, 13, 9, 3)),
+        (datetime(2026, 11, 13, 9, 10), datetime(2026, 11, 13, 9, 11)),
+    ]
+    assert join_close_spans(spans, timedelta(minutes=1)) == [
+        (datetime(2026, 11, 13, 9, 0), datetime(2026, 11, 13, 9, 3)),
+        (datetime(2026, 11, 13, 9, 10), datetime(2026, 11, 13, 9, 11)),
+    ]
+
+
+async def test_client_reads_all_pages_of_search(tmp_path):
+    def item(hour):
+        return (
+            '<searchMatchItem><timeSpan>'
+            f'<startTime>2026-11-13T{hour:02d}:00:00Z</startTime>'
+            f'<endTime>2026-11-13T{hour:02d}:05:00Z</endTime>'
+            '</timeSpan></searchMatchItem>'
+        )
+
+    def page(hours, status):
+        return (
+            f'<CMSearchResult><responseStatusStrg>{status}</responseStatusStrg>'
+            f'<matchList>{"".join(item(h) for h in hours)}</matchList></CMSearchResult>'
+        )
+
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        bodies.append(body)
+        if '<searchResultPostion>0<' in body:
+            return httpx.Response(200, text=page([8, 9], 'MORE'))
+        return httpx.Response(200, text=page([10], 'OK'))
+
+    client = _client(tmp_path, handler)
+    day = datetime(2026, 11, 13)
+    recordings = await client.find_recordings(
+        6, day, day + timedelta(days=1), StreamType.MAIN
+    )
+    assert [rec.start.hour for rec in recordings] == [8, 9, 10]
+    assert '<searchResultPostion>2<' in bodies[1]
+
+    # One request when the number of results is limited.
+    bodies.clear()
+    await client.find_recordings(
+        6, day, day + timedelta(days=1), StreamType.MAIN, max_results=1
+    )
+    assert len(bodies) == 1
+
+
+@requires_config
+async def test_day_shows_hours_and_hour_button_asks_to_confirm(tmp_path, monkeypatch):
+    from hikcamerabot.archive import handlers
+
+    monkeypatch.setattr(handlers, '_pending', {})
+    bot = _bot()
+    service = _service(tmp_path, bot)
+    client = service.client('nvr_1')
+    client.get_channels = AsyncMock(return_value={6: 'HR'})
+    day = datetime.now().date() - timedelta(days=2)
+    start = datetime.combine(day, datetime.min.time())
+    client.find_recordings = AsyncMock(
+        return_value=[
+            Recording(start + timedelta(hours=9), start + timedelta(hours=10)),
+            Recording(
+                start + timedelta(hours=14), start + timedelta(hours=14, minutes=5)
+            ),
+        ]
+    )
+
+    query = _query(f'arc|d|0|6|{day.strftime("%Y%m%d")}')
+    await handlers.on_archive_callback(bot, query)
+    args = query.message.edit_text.await_args
+    assert 'Запись есть: 1 ч 5 мин' in args.args[0]
+    assert '09:00–10:00, 14:00–14:05' in args.args[0]
+    buttons = {
+        btn.text: btn.callback_data
+        for row in args.kwargs['reply_markup'].inline_keyboard
+        for btn in row
+    }
+    assert len([text for text in buttons if text[:2].isdigit()]) == 24
+    assert buttons['09 🟩'] == f'arc|t|0|6|{day.strftime("%Y%m%d")}09'
+    assert buttons['14 🟨'].startswith('arc|t|')
+    assert buttons['03 ⬜'].startswith('arc|z|')
+
+    empty = _query(buttons['03 ⬜'])
+    await handlers.on_archive_callback(bot, empty)
+    assert 'записи нет' in empty.answer.await_args.args[0]
+
+    hour = _query(buttons['09 🟩'])
+    hour.message.reply_text = AsyncMock()
+    await handlers.on_archive_callback(bot, hour)
+    text = hour.message.reply_text.await_args.args[0]
+    assert '09:00–10:00 (1 ч)' in text
+    assert 'Запись есть за весь отрезок' in text
+
+
+@requires_config
+async def test_days_are_marked_with_recordings(tmp_path):
+    from hikcamerabot.archive import handlers
+
+    service = _service(tmp_path)
+
+    async def find(channel, start, end, stream, max_results=None):
+        return [Recording(start, end)] if start.date() == TODAY else []
+
+    service.client('nvr_1').find_recordings = find
+    days = [TODAY, TODAY - timedelta(days=1)]
+    marks = await service.days_with_recordings('nvr_1', 6, days)
+    assert marks == {days[0]: True, days[1]: False}
+
+    markup = handlers.build_days_keyboard(0, 6, TODAY, marks)
+    texts = [btn.text for row in markup.inline_keyboard for btn in row]
+    assert texts[:3] == ['Сегодня ✅', 'Вчера ❌', '13.11 пт']
+
+    service.client('nvr_1').find_recordings = AsyncMock(side_effect=OSError('down'))
+    assert await service.days_with_recordings('nvr_1', 6, days) == {}
