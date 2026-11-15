@@ -6,6 +6,7 @@ from httpx import TransportError
 from hikcamerabot.enums import DetectionType, ServiceType
 from hikcamerabot.exceptions import (
     AlarmEventChunkDetectorError,
+    APIAuthError,
     ChunkLoopError,
     HikvisionAPIError,
 )
@@ -34,7 +35,11 @@ class ServiceAlarmMonitoringTask(AbstractServiceTask):
     async def run(self) -> None:
         """Monitor alarm/alert chunks, reconnecting with backoff on errors."""
         await retry_forever(
-            self._run, logger=self._log, name=f'{self._cam.id} alert pusher task'
+            self._run,
+            logger=self._log,
+            name=f'{self._cam.id} alert pusher task',
+            # Wrong password: frequent attempts keep the user locked on camera.
+            slow_exceptions=(APIAuthError,),
         )
 
     async def _run(self) -> None:

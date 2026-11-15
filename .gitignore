@@ -7,6 +7,8 @@ camerabot.log
 .idea/
 tmp*
 /configs/config.json
+/configs/.bot_state.json*
+/configs/*.bak*
 /configs/livestream_templates.json
 /configs/encoding_templates.json
 /*.yaml

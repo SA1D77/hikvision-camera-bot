@@ -279,3 +279,16 @@ def test_version_regex_reads_version_file():
     assert _VERSION_REGEX.search("__version__ = '2.10.3'\n").group(1) == '2.10.3'
     assert BotVersion(current='2.0.1', latest='2.0.10').has_new_version()
     assert not BotVersion(current='2.0.1', latest='2.0.1').has_new_version()
+
+
+async def test_link_notifier_reports_rejected_password_at_once():
+    from hikcamerabot.exceptions import APIAuthError
+
+    bot = SimpleNamespace(send_alert_message=AsyncMock())
+    notifier = CameraLinkNotifier(bot=bot, title='Двор (cam_1)', notify_after=60)
+
+    await notifier.on_failure(APIAuthError('Bad response code 401', status_code=401))
+    await notifier.on_failure(APIAuthError('Bad response code 401', status_code=401))
+
+    assert bot.send_alert_message.await_count == 1
+    assert ERR_AUTH in bot.send_alert_message.await_args.args[0]

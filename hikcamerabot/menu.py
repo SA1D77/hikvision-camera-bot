@@ -5,6 +5,7 @@ answer with a short popup instead of new chat messages. Alert settings changed
 from the menu are saved to `configs/config.json` and survive bot restarts.
 """
 
+import asyncio
 import contextlib
 import inspect
 import logging
@@ -24,6 +25,7 @@ from pyrogram.types import (
 import hikcamerabot.callbacks as cb
 from hikcamerabot.clients.hikvision.enums import IrcutFilterType
 from hikcamerabot.config.schemas.main_config import AlertSchema, DetectionSchema
+from hikcamerabot.config.state import StateStore
 from hikcamerabot.config.store import ConfigStore
 from hikcamerabot.constants import TG_MAX_MSG_SIZE
 from hikcamerabot.decorators import authorization_check
@@ -103,10 +105,44 @@ _OFF: Final[str] = '❌'
 
 _config_store = ConfigStore()
 
+_state_store = StateStore()
+
+
+def _load_panels(state: dict) -> dict[int, int]:
+    panels = state.get('panels')
+    if not isinstance(panels, dict):
+        return {}
+    result: dict[int, int] = {}
+    for chat_id, message_id in panels.items():
+        with contextlib.suppress(TypeError, ValueError):
+            result[int(chat_id)] = int(message_id)
+    return result
+
+
+def _load_ir_modes(state: dict) -> dict[str, str]:
+    ir_modes = state.get('ir_modes')
+    if not isinstance(ir_modes, dict):
+        return {}
+    return {str(cam_id): code for cam_id, code in ir_modes.items() if code in _IR_MODES}
+
+
+_saved_state = _state_store.load()
+# Both are restored after a bot restart from the state file.
 # Chat ID -> message ID of the last opened panel, to keep only one in chat.
-_panels: dict[int, int] = {}
+_panels: dict[int, int] = _load_panels(_saved_state)
 # Camera ID -> last IR mode set from the menu (camera doesn't report it).
-_ir_modes: dict[str, str] = {}
+_ir_modes: dict[str, str] = _load_ir_modes(_saved_state)
+
+
+async def _save_state() -> None:
+    state = {
+        'panels': {str(chat_id): msg_id for chat_id, msg_id in _panels.items()},
+        'ir_modes': dict(_ir_modes),
+    }
+    try:
+        await asyncio.to_thread(_state_store.save, state)
+    except Exception:
+        log.exception('Failed to save menu state')
 
 
 def make_callback_data(action: str, cam_id: str = '', *args: str) -> str:
@@ -353,6 +389,7 @@ async def cmd_menu(bot: 'CameraBot', message: Message) -> None:
         text, markup = _CAMERAS_TEXT, build_cameras_keyboard(bot)
     panel = await bot.send_message(chat_id, text, reply_markup=markup)
     _panels[chat_id] = panel.id
+    await _save_state()
 
 
 @authorization_check
@@ -424,6 +461,7 @@ async def _process_action(  # noqa: PLR0911
         _panels.pop(message.chat.id, None)
         await query.answer()
         await message.delete()
+        await _save_state()
         return
 
     try:
@@ -552,6 +590,7 @@ async def _set_ir_mode(message: Message, cam: 'HikvisionCam', code: str = '') ->
     filter_type, label = _IR_MODES[code]
     await cam.set_ircut_filter(filter_type)
     _ir_modes[cam.id] = code
+    await _save_state()
     await _show_camera(cam.bot, message, cam)
     return f'{label}: режим включён'
 

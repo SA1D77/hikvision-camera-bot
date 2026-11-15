@@ -1,6 +1,6 @@
 [project]
 name = "hikvision-camera-bot"
-version = "2.0.1"
+version = "2.1.0"
 description = "Telegram Bot which sends snapshots from your Hikvision cameras"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,7 +14,8 @@ dependencies = [
     "tenacity>=9.0.0",
     "tgcrypto-pyrofork>=1.2.7",
     "uvloop>=0.21.0 ; sys_platform == 'linux'",
-    "xmltodict>=0.14.2",
+    # 1.0 changes XML handling: check against a real camera before upgrading.
+    "xmltodict>=0.14.2,<1",
 ]
 
 [dependency-groups]
@@ -93,6 +94,7 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff.format]
 indent-style = "space"

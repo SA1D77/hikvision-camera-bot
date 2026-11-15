@@ -2,7 +2,7 @@
 
 Telegram Bot which sends snapshots from your Hikvision cameras.
 
-Version: 2.0.1. [Release details](releases/release_2.0.1.md).
+Version: 2.1.0. [Release details](releases/release_2.1.md).
 
 > Runs on Raspberry Pi 4/5 (64-bit OS) with Docker. Russian guide: [docs/RASPBERRY_PI_RU.md](docs/RASPBERRY_PI_RU.md).
 

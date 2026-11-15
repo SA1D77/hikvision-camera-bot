@@ -18,6 +18,8 @@ RETRY_MIN_DELAY: Final[float] = 0.5
 RETRY_MAX_DELAY: Final[float] = 30.0
 # If the coroutine worked at least this long, consider it healthy and reset delay.
 RETRY_RESET_AFTER: Final[float] = 60.0
+# Pause after errors which don't go away by themselves (e.g. wrong password).
+RETRY_SLOW_DELAY: Final[float] = 600.0
 
 
 def create_task[T](
@@ -84,12 +86,18 @@ async def retry_forever(
     min_delay: float = RETRY_MIN_DELAY,
     max_delay: float = RETRY_MAX_DELAY,
     reset_after: float = RETRY_RESET_AFTER,
+    slow_exceptions: tuple[type[Exception], ...] = (),
+    slow_delay: float = RETRY_SLOW_DELAY,
 ) -> None:
     """Run `func` until it returns normally, restarting it on any exception.
 
     Delay between restarts grows exponentially (`min_delay` -> `max_delay`) so an
     unreachable camera doesn't flood logs and CPU, and resets to `min_delay`
     once the function has been working fine for `reset_after` seconds.
+
+    After `slow_exceptions` the restart is delayed for `slow_delay` seconds:
+    e.g. repeating a rejected password every 30 seconds keeps the user locked
+    on the camera.
     """
     delay = min_delay
     while True:
@@ -98,7 +106,13 @@ async def retry_forever(
             await func()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as err:
+            if isinstance(err, slow_exceptions):
+                logger.warning(
+                    '"%s" failed, restarting in %.0f seconds', name, slow_delay
+                )
+                await asyncio.sleep(slow_delay)
+                continue
             if time.monotonic() - started_at >= reset_after:
                 delay = min_delay
             logger.warning('"%s" failed, restarting in %.1f seconds', name, delay)

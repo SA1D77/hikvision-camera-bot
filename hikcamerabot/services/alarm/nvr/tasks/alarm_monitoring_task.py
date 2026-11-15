@@ -7,6 +7,7 @@ from hikcamerabot.camera import HikvisionCam
 from hikcamerabot.enums import DetectionType
 from hikcamerabot.exceptions import (
     AlarmEventChunkDetectorError,
+    APIAuthError,
     ChunkLoopError,
     HikvisionAPIError,
 )
@@ -56,7 +57,11 @@ class NvrAlarmMonitoringTask:
     async def run(self) -> None:
         """Monitor NVR alarm chunks, reconnecting with backoff on errors."""
         await retry_forever(
-            self._run, logger=self._log, name=f'NVR "{self._host}" alarm task'
+            self._run,
+            logger=self._log,
+            name=f'NVR "{self._host}" alarm task',
+            # Wrong password: frequent attempts keep the user locked on NVR.
+            slow_exceptions=(APIAuthError,),
         )
 
     async def _run(self) -> None:

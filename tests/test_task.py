@@ -84,3 +84,29 @@ async def test_cancel_background_tasks():
     task = create_task(asyncio.Event().wait(), logger=log, task_name='cancel-test')
     await cancel_background_tasks(wait_timeout=1)
     assert task.cancelled()
+
+
+async def test_retry_forever_waits_long_after_slow_exceptions(sleeps):
+    calls = 0
+
+    async def flaky():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError('camera is offline')
+        if calls in (2, 3):
+            raise PermissionError('wrong password')
+        if calls == 4:
+            raise ConnectionError('camera is offline')
+
+    await retry_forever(
+        flaky,
+        logger=log,
+        name='test',
+        min_delay=1,
+        max_delay=30,
+        slow_exceptions=(PermissionError,),
+        slow_delay=600,
+    )
+    # Slow errors wait long and don't change the regular backoff.
+    assert sleeps == [1, 600, 600, 2]

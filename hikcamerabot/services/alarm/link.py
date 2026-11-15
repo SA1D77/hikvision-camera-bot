@@ -4,6 +4,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Final
 
+from hikcamerabot.exceptions import APIAuthError
 from hikcamerabot.utils.errors import describe_error
 from hikcamerabot.utils.system import format_duration
 
@@ -39,7 +40,11 @@ class CameraLinkNotifier:
         now = time.monotonic()
         if self._failing_since is None:
             self._failing_since = now
-        if self._notified or now - self._failing_since < self._notify_after:
+        if self._notified:
+            return
+        # A rejected password doesn't fix itself: no need to wait.
+        is_auth_err = isinstance(err, APIAuthError)
+        if not is_auth_err and now - self._failing_since < self._notify_after:
             return
         self._notified = True
         self._log.warning('%s is offline, notifying users', self._title)
