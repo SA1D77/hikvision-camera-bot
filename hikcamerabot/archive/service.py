@@ -59,6 +59,7 @@ _DEPTH_CONCURRENCY: Final[int] = 4
 _DEPTH_NAME_MAX_LEN: Final[int] = 22
 _DEPTH_MAX_LINES: Final[int] = 70
 _DAY_SPANS_SHOWN: Final[int] = 12
+_CLOCK_MAX_DIFF: Final[timedelta] = timedelta(minutes=5)
 
 STREAM_NAMES: Final[dict[StreamType, str]] = {
     StreamType.MAIN: 'основной поток',
@@ -103,13 +104,17 @@ class ChannelDepth:
     error: str | None = None
     # Was the camera recorded during the last 24 hours? None - not checked.
     recent: bool | None = None
+    # End of the last recording, searched when there are no recent ones.
+    newest: datetime | None = None
 
 
 def depth_days(oldest: datetime, now: datetime) -> int:
     return max((now.date() - oldest.date()).days, 0)
 
 
-def format_depth_report(depths: list[ChannelDepth], now: datetime) -> str:
+def format_depth_report(  # noqa: C901, PLR0912
+    depths: list[ChannelDepth], now: datetime
+) -> str:
     """Return text: how many days of recordings NVR keeps, per camera too."""
     if not depths:
         return 'На регистраторе нет камер.'
@@ -144,6 +149,9 @@ def format_depth_report(depths: list[ChannelDepth], now: datetime) -> str:
             )
             if item.recent is False:
                 value += ' ⚠️ за сутки записи нет'
+                if item.newest:
+                    last = item.newest.strftime(f'{_DATE_FORMAT} {_TIME_FORMAT}')
+                    value += f', последняя {last}'
         elif item.error:
             value = '⚠️ не удалось проверить'
         else:
@@ -278,10 +286,12 @@ class ArchiveService:
                         err,
                     )
                     return ChannelDepth(channel, name, error=str(err) or 'error')
-                recent = None
+                recent, newest = None, None
                 if oldest:
                     try:
                         recent = await client.has_recent_recording(channel)
+                        if not recent:
+                            newest = await client.get_newest_recording(channel, oldest)
                     except Exception as err:
                         self._log.warning(
                             'Failed to check recent recordings of "%s" channel %s: %s',
@@ -289,7 +299,9 @@ class ArchiveService:
                             channel,
                             err,
                         )
-            return ChannelDepth(channel, name, oldest=oldest, recent=recent)
+            return ChannelDepth(
+                channel, name, oldest=oldest, recent=recent, newest=newest
+            )
 
         return list(
             await asyncio.gather(
@@ -315,13 +327,51 @@ class ArchiveService:
             return ''
         spans = covered_spans(recordings or [], day_start, day_end)
         if not spans:
-            return f'За весь день {date_text} регистратор не нашёл записей этой камеры.'
+            return (
+                f'За весь день {date_text} регистратор не нашёл записей '
+                f'этой камеры.{await self._describe_last_recording(nvr_id, channel)}'
+            )
         shown = ', '.join(
             format_period(span_start, span_end)[_DATE_PREFIX_LEN:]
             for span_start, span_end in spans[:_DAY_SPANS_SHOWN]
         )
         more = ' и другие' if len(spans) > _DAY_SPANS_SHOWN else ''
         return f'В этот день ({date_text}) запись есть за: {shown}{more}.'
+
+    async def _describe_last_recording(self, nvr_id: str, channel: int) -> str:
+        """Tell period of all recordings of the camera, empty string on errors."""
+        client = self._clients[nvr_id]
+        try:
+            oldest = await client.get_oldest_recording(channel)
+            if oldest is None:
+                return '\nУ этой камеры на регистраторе вообще нет записей.'
+            newest = await client.get_newest_recording(channel, oldest)
+        except Exception as err:
+            self._log.warning('Failed to find the last recording: %s', err)
+            return ''
+        if newest is None:
+            return ''
+        fmt = f'{_DATE_FORMAT} {_TIME_FORMAT}'
+        return (
+            f'\nРегистратор отдаёт записи этой камеры с {oldest.strftime(fmt)} '
+            f'по {newest.strftime(fmt)}.'
+        )
+
+    async def describe_clock(self, nvr_id: str) -> str:
+        """Tell the clock of NVR and warn if it differs from the bot one."""
+        try:
+            nvr_time = await self._clients[nvr_id].get_time()
+        except Exception as err:
+            self._log.warning('Failed to get time of "%s": %s', nvr_id, err)
+            return ''
+        text = f'🕒 Часы регистратора: {nvr_time.strftime(f"{_DATE_FORMAT} {_TIME_FORMAT}")}'
+        diff = abs(nvr_time - datetime.now())  # noqa: DTZ005
+        if diff > _CLOCK_MAX_DIFF:
+            text += (
+                f'\n⚠️ Они отличаются от часов бота на {format_minutes(diff)}: '
+                'записи ищутся по часам регистратора.'
+            )
+        return text
 
     def part_seconds(self, recordings: list[Recording] | None) -> int:
         """Return length of one video so that it fits Telegram file limit."""

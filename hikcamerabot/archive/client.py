@@ -31,6 +31,7 @@ _CHANNELS_ENDPOINT: Final[str] = 'ISAPI/ContentMgmt/InputProxy/channels'
 _STREAMING_CHANNELS_ENDPOINT: Final[str] = 'ISAPI/Streaming/channels'
 _SEARCH_ENDPOINT: Final[str] = 'ISAPI/ContentMgmt/search'
 _PICTURE_ENDPOINT: Final[str] = 'ISAPI/Streaming/channels/{track_id}/picture'
+_TIME_ENDPOINT: Final[str] = 'ISAPI/System/time'
 _SNAPSHOT_TIMEOUT: Final[float] = 15.0
 # `...&name=ch26_0001&size=1049123456`: size of the recorded file in bytes.
 _PLAYBACK_URI_SIZE_REGEX: Final[re.Pattern[str]] = re.compile(r'[?&]size=(\d+)')
@@ -42,6 +43,9 @@ _SEARCH_MAX_RESULTS: Final[int] = 50
 _OLDEST_SEARCH_DAYS: Final[int] = 3650
 _RECENT_HOURS: Final[int] = 24
 _LOGGED_RESPONSE_SIZE: Final[int] = 400
+# The newest recording is searched by halving the period down to this size.
+_NEWEST_SEARCH_PRECISION: Final[timedelta] = timedelta(hours=1)
+_NEWEST_SEARCH_MAX_STEPS: Final[int] = 24
 # Track ID is `<channel><stream>`: 2601 is channel 26 main stream, 2602 - sub.
 _TRACK_MULTIPLIER: Final[int] = 100
 
@@ -116,6 +120,12 @@ def parse_streaming_channels(xml_text: str) -> dict[int, str]:
             name = str(item.get('channelName') or '').strip()
             channels[channel] = channels.get(channel) or name
     return channels
+
+
+def parse_device_time(xml_text: str) -> datetime:
+    """Return local time of NVR from `Time` (`2026-11-15T18:53:00+05:00`)."""
+    root = xmltodict.parse(xml_text).get('Time') or {}
+    return datetime.fromisoformat(str(root['localTime'])).replace(tzinfo=None)
 
 
 def _parse_size(item: dict) -> int | None:
@@ -261,6 +271,37 @@ class NvrArchiveClient:
             max_results=1,
         )
         return recordings[0].start if recordings else None
+
+    async def get_time(self) -> datetime:
+        """Return the clock of NVR: recordings are searched by it."""
+        text = await self._request('GET', _TIME_ENDPOINT)
+        try:
+            return parse_device_time(text)
+        except Exception as err:
+            raise HikvisionAPIError(f'Unexpected time response: {err}') from err
+
+    async def get_newest_recording(
+        self, channel: int, oldest: datetime
+    ) -> datetime | None:
+        """Return the end of the last recording of the camera.
+
+        NVR can't sort from the newest, so the period from the oldest recording
+        till now is halved until the last recorded hour is found.
+        """
+        low = oldest
+        high = datetime.now() + timedelta(days=1)  # noqa: DTZ005
+        for _ in range(_NEWEST_SEARCH_MAX_STEPS):
+            if high - low <= _NEWEST_SEARCH_PRECISION:
+                break
+            middle = low + (high - low) / 2
+            if await self.find_recordings(
+                channel, middle, high, StreamType.MAIN, max_results=1
+            ):
+                low = middle
+            else:
+                high = middle
+        recordings = await self.find_recordings(channel, low, high, StreamType.MAIN)
+        return max((rec.end for rec in recordings), default=None)
 
     async def has_recent_recording(self, channel: int) -> bool:
         """Tell whether the camera was recorded during the last 24 hours."""

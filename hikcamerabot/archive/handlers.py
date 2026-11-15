@@ -334,9 +334,10 @@ async def _depth_step(
             markup,
         )
     now = datetime.now()  # noqa: DTZ005
+    clock = await service.describe_clock(nvr_id)
     return (
         f'{header}\n{format_depth_report(depths, now)}\n\n'
-        f'Проверено {now.strftime("%d.%m.%Y %H:%M")}',
+        f'{clock}\nПроверено {now.strftime("%d.%m.%Y %H:%M")}',
         markup,
     )
 

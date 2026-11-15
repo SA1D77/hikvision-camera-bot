@@ -1010,6 +1010,8 @@ async def test_depth_button_shows_report(tmp_path):
 
     client.get_oldest_recording = oldest
     client.has_recent_recording = AsyncMock(return_value=False)
+    client.get_newest_recording = AsyncMock(return_value=datetime(2026, 6, 10, 14, 22))
+    client.get_time = AsyncMock(return_value=datetime(2026, 6, 10, 15, 0))
     markup = handlers.build_channels_keyboard({1: 'Вход'}, 0, 0, None)
     assert 'arc|h|0' in [
         btn.callback_data for row in markup.inline_keyboard for btn in row
@@ -1020,7 +1022,9 @@ async def test_depth_button_shows_report(tmp_path):
     text = query.message.edit_text.await_args.args[0]
     assert 'Глубина архива' in text
     assert '1. Вход — 30 дней' in text
-    assert 'за сутки записи нет' in text
+    assert 'за сутки записи нет, последняя 10.06.2026 14:22' in text
+    assert 'Часы регистратора: 10.06.2026 15:00' in text
+    assert 'отличаются от часов бота' in text
     assert 'За последние сутки писались: 0 из 2' in text
     assert '2. Склад — ⚠️ не удалось проверить' in text
 
@@ -1168,4 +1172,51 @@ async def test_describe_day_lists_recorded_time(tmp_path):
     assert args[2:4] == (datetime(2026, 11, 13), datetime(2026, 11, 14))
 
     service.find_recordings = AsyncMock(return_value=[])
-    assert 'За весь день' in await service.describe_day('nvr_1', 6, day)
+    client = service.client('nvr_1')
+    client.get_oldest_recording = AsyncMock(return_value=datetime(2026, 6, 5, 8, 0))
+    client.get_newest_recording = AsyncMock(return_value=datetime(2026, 6, 10, 14, 22))
+    text = await service.describe_day('nvr_1', 6, day)
+    assert 'За весь день' in text
+    assert 'с 05.06.2026 08:00 по 10.06.2026 14:22' in text
+
+
+# The newest recording and the clock of NVR.
+
+
+async def test_client_newest_recording_is_found_by_halving(tmp_path):
+    import re
+
+    last_start = datetime(2026, 6, 10, 14, 0)
+    last_end = datetime(2026, 6, 10, 14, 22)
+    item = (
+        '<CMSearchResult><matchList><searchMatchItem><timeSpan>'
+        '<startTime>2026-06-10T14:00:00Z</startTime>'
+        '<endTime>2026-06-10T14:22:00Z</endTime>'
+        '</timeSpan></searchMatchItem></matchList></CMSearchResult>'
+    )
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        requests.append(body)
+        start, end = (
+            datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ')
+            for value in re.findall(r'Time>([^<]+)</', body)
+        )
+        overlaps = start < last_end and end > last_start
+        return httpx.Response(200, text=item if overlaps else NO_MATCHES_XML)
+
+    client = _client(tmp_path, handler)
+    newest = await client.get_newest_recording(6, datetime(2026, 6, 5, 8, 0))
+    assert newest == last_end
+    assert len(requests) < 20
+
+
+async def test_client_time(tmp_path):
+    xml = (
+        '<Time><timeMode>NTP</timeMode>'
+        '<localTime>2026-11-15T18:53:00+05:00</localTime>'
+        '<timeZone>CST-5:00:00</timeZone></Time>'
+    )
+    client = _client(tmp_path, lambda _: httpx.Response(200, text=xml))
+    assert await client.get_time() == datetime(2026, 11, 15, 18, 53)
