@@ -1030,7 +1030,7 @@ async def test_depth_button_shows_report(tmp_path):
     assert 'Часы регистратора: 10.06.2026 15:00' in text
     assert 'отличаются от часов бота' in text
     assert 'Писались за последние сутки: 0 из 2' in text
-    assert '2. Склад — ⚠️ не удалось проверить' in text
+    assert '• 2. Склад — не удалось проверить' in text
 
     client.get_channels = AsyncMock(side_effect=APIAuthError('403', status_code=403))
     query = _query('arc|h|0')
