@@ -18,6 +18,13 @@ from hikcamerabot.archive.client import (
     track_id,
 )
 from hikcamerabot.archive.exporter import build_export_cmd, split_period
+from hikcamerabot.archive.recordings import (
+    Recording,
+    choose_part_seconds,
+    covered_spans,
+    estimate_size,
+    is_fully_covered,
+)
 from hikcamerabot.archive.timeparse import (
     ArchiveInputError,
     parse_day,
@@ -25,7 +32,7 @@ from hikcamerabot.archive.timeparse import (
     parse_time_range,
 )
 from hikcamerabot.config.schemas.main_config import ArchiveSchema
-from hikcamerabot.exceptions import APIAuthError
+from hikcamerabot.exceptions import APIAuthError, HikvisionAPIError
 from tests.conftest import requires_config
 
 TODAY = date(2026, 11, 15)
@@ -56,6 +63,9 @@ SEARCH_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <matchList>
 <searchMatchItem><trackID>2601</trackID>
 <timeSpan><startTime>2026-11-15T13:40:00Z</startTime><endTime>2026-11-15T14:10:00Z</endTime></timeSpan>
+<mediaSegmentDescriptor><contentType>video</contentType>
+<playbackURI>rtsp://192.168.1.10/Streaming/tracks/2601/?starttime=20261115T134000Z&amp;endtime=20261115T141000Z&amp;name=ch26_02&amp;size=900000000</playbackURI>
+</mediaSegmentDescriptor>
 </searchMatchItem>
 <searchMatchItem><trackID>2601</trackID>
 <timeSpan><startTime>2026-11-15T13:00:00Z</startTime><endTime>2026-11-15T13:40:00Z</endTime></timeSpan>
@@ -201,8 +211,12 @@ def test_parse_streaming_channels():
 
 def test_parse_search_result():
     assert parse_search_result(SEARCH_XML) == [
-        (datetime(2026, 11, 15, 13, 0), datetime(2026, 11, 15, 13, 40)),
-        (datetime(2026, 11, 15, 13, 40), datetime(2026, 11, 15, 14, 10)),
+        Recording(datetime(2026, 11, 15, 13, 0), datetime(2026, 11, 15, 13, 40)),
+        Recording(
+            datetime(2026, 11, 15, 13, 40),
+            datetime(2026, 11, 15, 14, 10),
+            size=900_000_000,
+        ),
     ]
     assert parse_search_result(NO_MATCHES_XML) == []
 
@@ -364,6 +378,11 @@ def _job(**overrides):
     return ArchiveJob(**data)
 
 
+def _recording(size=None, minutes=30):
+    start = datetime(2026, 11, 14, 13, 30)
+    return Recording(start, start + timedelta(minutes=minutes), size=size)
+
+
 def _last_status(bot) -> str:
     return bot.edit_message_text.await_args.args[2]
 
@@ -458,7 +477,7 @@ async def test_job_reports_too_big_file(tmp_path, monkeypatch):
 
     bot = _bot()
     service = _service(tmp_path, bot, part_minutes=60)
-    service.client('nvr_1').find_recordings = AsyncMock(return_value=[(1, 2)])
+    service.client('nvr_1').find_recordings = AsyncMock(return_value=[_recording()])
 
     async def fake_export(url, file_path, duration, on_progress=None):
         file_path.write_bytes(b'12345678')
@@ -478,7 +497,7 @@ async def test_job_failed_export_is_reported(tmp_path):
 
     bot = _bot()
     service = _service(tmp_path, bot, part_minutes=60)
-    service.client('nvr_1').find_recordings = AsyncMock(return_value=[(1, 2)])
+    service.client('nvr_1').find_recordings = AsyncMock(return_value=[_recording()])
     service._exporter.export = AsyncMock(side_effect=ArchiveExportError('empty'))
 
     await service._run_job(_job())
@@ -492,7 +511,8 @@ def test_channels_keyboard_pages_and_callback_data_size():
     from hikcamerabot.archive import handlers
 
     channels = {n: f'Очень длинное название камеры номер {n}' for n in range(1, 65)}
-    markup = handlers.build_channels_keyboard(channels, 0, page=1, show_back=True)
+    back = handlers._btn('⬅️ Регистраторы', 'r', 0, 0)
+    markup = handlers.build_channels_keyboard(channels, 0, page=1, back=back)
     buttons = [btn for row in markup.inline_keyboard for btn in row]
     texts = [btn.text for btn in buttons]
     assert texts[0].startswith('11. ')
@@ -532,6 +552,7 @@ def _query(data: str, user_id: int = 1, chat_id: int = 1):
     query.message = MagicMock()
     query.message.id = 77
     query.message.chat = SimpleNamespace(id=chat_id)
+    query.message.photo = None
     query.message.edit_text = AsyncMock()
     query.message.edit_reply_markup = AsyncMock()
     query.message.delete = AsyncMock()
@@ -597,6 +618,12 @@ async def test_day_button_then_time_text_asks_to_confirm(tmp_path, monkeypatch):
     service = _service(tmp_path, bot)
     service.client('nvr_1').get_channels = AsyncMock(return_value={26: 'Склад'})
     day = datetime.now().date() - timedelta(days=1)
+    found = Recording(
+        datetime.combine(day, datetime.min.time()),
+        datetime.combine(day, datetime.min.time()) + timedelta(days=1),
+        size=86400 * 500_000,
+    )
+    service.client('nvr_1').find_recordings = AsyncMock(return_value=[found])
 
     await handlers.on_archive_callback(
         bot, _query(f'arc|d|0|26|{day.strftime("%Y%m%d")}')
@@ -618,6 +645,8 @@ async def test_day_button_then_time_text_asks_to_confirm(tmp_path, monkeypatch):
     text = message.reply_text.await_args.args[0]
     assert 'камера 26 «Склад»' in text
     assert '13:30–14:00 (30 мин)' in text
+    assert 'Запись есть за весь отрезок' in text
+    assert 'Примерный размер: 858.3MiB' in text
     markup = message.reply_text.await_args.kwargs['reply_markup']
     go_data = markup.inline_keyboard[0][0].callback_data
     assert go_data == f'arc|g|0|26|{day.strftime("%Y%m%d")}1330|30|m'
@@ -631,6 +660,7 @@ async def test_archive_command_with_arguments(tmp_path, monkeypatch):
     bot = _bot()
     service = _service(tmp_path, bot)
     service.client('nvr_1').get_channels = AsyncMock(return_value={})
+    service.client('nvr_1').find_recordings = AsyncMock(side_effect=RuntimeError)
     message = MagicMock()
     message.chat = SimpleNamespace(id=1)
     message.from_user = SimpleNamespace(id=1)
@@ -644,3 +674,240 @@ async def test_archive_command_with_arguments(tmp_path, monkeypatch):
     message.text = '/archive склад'
     await handlers.cmd_archive(bot, message)
     assert 'Формат' in message.reply_text.await_args.args[0]
+
+
+# Recordings: coverage and size.
+
+
+def test_recordings_coverage_and_size():
+    start = datetime(2026, 11, 15, 13, 30)
+    end = start + timedelta(minutes=30)
+    recordings = [
+        Recording(start - timedelta(minutes=30), start + timedelta(minutes=10), 2400),
+        # 2 seconds gap between files is merged.
+        Recording(
+            start + timedelta(minutes=10, seconds=2), start + timedelta(minutes=20), 598
+        ),
+    ]
+    spans = covered_spans(recordings, start, end)
+    assert spans == [(start, start + timedelta(minutes=20))]
+    assert not is_fully_covered(spans, start, end)
+    assert is_fully_covered(spans, start, start + timedelta(minutes=20))
+    # 2998 bytes for 2998 seconds: 1 byte per second, 20 minutes are covered.
+    assert estimate_size(recordings, start, end) == 1200
+    assert estimate_size([Recording(start, end)], start, end) is None
+    assert covered_spans(recordings, end, end + timedelta(hours=1)) == []
+
+
+def test_choose_part_seconds_fits_telegram_limit():
+    hour = datetime(2026, 11, 15, 13, 0)
+    # ~0.5 MB/s (4 Mbit/s): 15 minutes are ~450 MB, the config value is kept.
+    normal = [Recording(hour, hour + timedelta(hours=1), 3600 * 500_000)]
+    assert choose_part_seconds(normal, 900) == 900
+    # ~4 MB/s (32 Mbit/s): 15 minutes would be 3.6 GB, parts are made shorter.
+    heavy = [Recording(hour, hour + timedelta(hours=1), 3600 * 4_000_000)]
+    part = choose_part_seconds(heavy, 900)
+    assert part == 360
+    assert part * 4_000_000 < 2000 * 1024 * 1024
+    assert choose_part_seconds(None, 900) == 900
+    assert choose_part_seconds([Recording(hour, hour + timedelta(hours=1))], 900) == 900
+
+
+async def test_client_snapshot(tmp_path):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen['path'] = request.url.path
+        return httpx.Response(
+            200, content=b'\xff\xd8jpeg', headers={'content-type': 'image/jpeg'}
+        )
+
+    assert await _client(tmp_path, handler).get_snapshot(27) == b'\xff\xd8jpeg'
+    assert seen['path'] == '/ISAPI/Streaming/channels/2701/picture'
+
+    def xml_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text='<ResponseStatus/>', headers={'content-type': 'application/xml'}
+        )
+
+    with pytest.raises(HikvisionAPIError):
+        await _client(tmp_path, xml_handler).get_snapshot(27)
+
+
+@requires_config
+def test_describe_availability(tmp_path):
+    service = _service(tmp_path)
+    start = datetime(2026, 11, 14, 13, 30)
+    end = start + timedelta(minutes=30)
+
+    text, exportable = service.describe_availability(None, start, end)
+    assert exportable
+    assert 'не дал проверить' in text
+
+    text, exportable = service.describe_availability([], start, end)
+    assert not exportable
+    assert 'Записи за это время нет' in text
+
+    text, exportable = service.describe_availability(
+        [_recording(size=1800 * 500_000)], start, end
+    )
+    assert exportable
+    assert 'за весь отрезок' in text
+    assert 'Придёт 2 видео по 15 мин' in text
+
+    partial = [Recording(start, start + timedelta(minutes=12))]
+    text, exportable = service.describe_availability(partial, start, end)
+    assert exportable
+    assert 'частично (12 мин): 13:30–13:42' in text
+
+
+@requires_config
+async def test_job_skips_parts_without_recordings(tmp_path, monkeypatch):
+    from hikcamerabot.archive import service as service_module
+
+    bot = _bot()
+    service = _service(tmp_path, bot)
+    # Only the first 10 minutes of 30 are recorded.
+    service.client('nvr_1').find_recordings = AsyncMock(
+        return_value=[_recording(minutes=10)]
+    )
+    exported = []
+
+    async def fake_export(url, file_path, duration, on_progress=None):
+        exported.append(duration)
+        file_path.write_bytes(b'video')
+
+    service._exporter.export = fake_export
+    service._probe = AsyncMock(return_value=(600, 1920, 1080))
+    monkeypatch.setattr(
+        service_module,
+        'MakeThumbnailTask',
+        lambda **_: SimpleNamespace(run=AsyncMock(return_value=False)),
+    )
+
+    await service._run_job(_job())
+
+    assert exported == [900]
+    assert bot.send_video.await_count == 1
+
+
+def _many_nvrs_conf(tmp_path):
+    nvrs = {}
+    for region, count in (('Ташкент', 12), ('Самарканд', 2)):
+        for number in range(1, count + 1):
+            nvrs[f'{"tas" if region == "Ташкент" else "sam"}_{number}'] = {
+                'description': f'{region} {number}',
+                'group': region,
+                'host': f'http://10.0.{len(nvrs)}.10',
+                'auth': {'user': 'bot', 'password': 'pass', 'type': 'digest'},
+            }
+    return nvrs
+
+
+@requires_config
+async def test_regions_and_nvr_pages(tmp_path):
+    from hikcamerabot.archive import handlers
+
+    bot = _bot()
+    service = _service(tmp_path, bot, nvrs=_many_nvrs_conf(tmp_path))
+    assert handlers.get_groups(service) == [
+        ('Ташкент', list(range(12))),
+        ('Самарканд', [12, 13]),
+    ]
+
+    text, markup = await handlers._start_step(service)
+    assert 'Выберите регион' in text
+    labels = [btn.text for row in markup.inline_keyboard for btn in row]
+    assert labels[:2] == ['📍 Ташкент (12)', '📍 Самарканд (2)']
+
+    markup = handlers.build_nvrs_keyboard(service, 0, page=0)
+    buttons = [btn for row in markup.inline_keyboard for btn in row]
+    assert buttons[0].text == '🗄 Ташкент 1'
+    assert buttons[0].callback_data == 'arc|n|0|0'
+    assert '1 / 2' in [btn.text for btn in buttons]
+    assert '⬅️ Регионы' in [btn.text for btn in buttons]
+
+    second_page = handlers.build_nvrs_keyboard(service, 0, page=1)
+    assert second_page.inline_keyboard[0][0].text == '🗄 Ташкент 11'
+    samarkand = handlers.build_nvrs_keyboard(service, 1, page=0)
+    assert samarkand.inline_keyboard[0][0].callback_data == 'arc|n|12|0'
+
+    query = _query('arc|r|1|0')
+    await handlers.on_archive_callback(bot, query)
+    assert 'Самарканд' in query.message.edit_text.await_args.args[0]
+
+
+@requires_config
+async def test_camera_button_sends_picture_with_export_button(tmp_path):
+    from hikcamerabot.archive import handlers
+
+    bot = _bot(send_photo=AsyncMock())
+    service = _service(tmp_path, bot)
+    service.client('nvr_1').get_channels = AsyncMock(return_value={27: 'Ворота'})
+    service.client('nvr_1').get_snapshot = AsyncMock(return_value=b'jpeg')
+    query = _query('arc|c|0|27')
+
+    await handlers.on_archive_callback(bot, query)
+
+    service.client('nvr_1').get_snapshot.assert_awaited_once_with(27)
+    photo = bot.send_photo.await_args.args[1]
+    assert photo.getvalue() == b'jpeg'
+    kwargs = bot.send_photo.await_args.kwargs
+    assert 'камера 27 «Ворота»' in kwargs['caption']
+    assert kwargs['reply_markup'].inline_keyboard[0][0].callback_data == 'arc|e|0|27'
+    query.message.delete.assert_awaited_once()
+
+    # "Export" pressed under the picture: the picture stays, days are asked.
+    photo_query = _query('arc|e|0|27')
+    photo_query.message.photo = object()
+    await handlers.on_archive_callback(bot, photo_query)
+    assert 'За какой день' in bot.send_message.await_args.args[1]
+    photo_query.message.delete.assert_not_awaited()
+
+
+@requires_config
+async def test_camera_button_without_picture_still_offers_export(tmp_path):
+    from hikcamerabot.archive import handlers
+
+    bot = _bot(send_photo=AsyncMock())
+    service = _service(tmp_path, bot)
+    service.client('nvr_1').get_channels = AsyncMock(return_value={})
+    service.client('nvr_1').get_snapshot = AsyncMock(
+        side_effect=httpx.ConnectError('refused')
+    )
+    query = _query('arc|c|0|27')
+
+    await handlers.on_archive_callback(bot, query)
+
+    bot.send_photo.assert_not_awaited()
+    text = query.message.edit_text.await_args.args[0]
+    assert 'Не удалось получить кадр' in text
+    markup = query.message.edit_text.await_args.kwargs['reply_markup']
+    assert markup.inline_keyboard[0][0].callback_data == 'arc|e|0|27'
+
+
+@requires_config
+async def test_time_without_recordings_offers_other_time(tmp_path, monkeypatch):
+    from hikcamerabot.archive import handlers
+
+    day = datetime.now().date() - timedelta(days=1)
+    monkeypatch.setattr(handlers, '_pending', {1: (0, 27, day)})
+    bot = _bot()
+    service = _service(tmp_path, bot)
+    service.client('nvr_1').get_channels = AsyncMock(return_value={})
+    service.client('nvr_1').find_recordings = AsyncMock(return_value=[])
+    message = MagicMock()
+    message.chat = SimpleNamespace(id=1)
+    message.from_user = SimpleNamespace(id=1)
+    message.reply_text = AsyncMock()
+
+    message.text = '03:00-03:10'
+    await handlers.on_time_range_text(bot, message)
+    assert 'Записи за это время нет' in message.reply_text.await_args.args[0]
+    markup = message.reply_text.await_args.kwargs['reply_markup']
+    assert markup.inline_keyboard[0][0].callback_data == 'arc|e|0|27'
+
+    handlers._pending[1] = (0, 27, day)
+    message.text = '00:00-23:59'
+    await handlers.on_time_range_text(bot, message)
+    assert 'Слишком длинный отрезок' in message.reply_text.await_args.args[0]

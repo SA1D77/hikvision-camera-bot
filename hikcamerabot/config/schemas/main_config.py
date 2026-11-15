@@ -255,6 +255,8 @@ class ArchiveNvrSchema(StrictBaseModel):
     """NVR (or DVR) with recordings which can be exported to Telegram."""
 
     description: str
+    # Region or site, e.g. "Ташкент". NVRs are grouped by it in the menu.
+    group: str | None = None
     host: str
     port: IntMin1 = 80
     rtsp_port: IntMin1 = 554

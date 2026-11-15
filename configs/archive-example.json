@@ -6,8 +6,9 @@
     "part_minutes": 15,
     "users": [],
     "nvrs": {
-      "nvr_1": {
-        "description": "Офис",
+      "tashkent_1": {
+        "description": "Tashkent 1",
+        "group": "Ташкент",
         "host": "http://192.168.1.10",
         "port": 80,
         "rtsp_port": 554,
@@ -18,6 +19,26 @@
         },
         "channels": {
           "26": "Склад, ворота"
+        }
+      },
+      "tashkent_2": {
+        "description": "Tashkent 2",
+        "group": "Ташкент",
+        "host": "http://192.168.1.11",
+        "auth": {
+          "user": "archive-bot",
+          "password": "dummy-password",
+          "type": "digest"
+        }
+      },
+      "samarkand_1": {
+        "description": "Samarkand 1",
+        "group": "Самарканд",
+        "host": "http://192.168.2.10",
+        "auth": {
+          "user": "archive-bot",
+          "password": "dummy-password",
+          "type": "digest"
         }
       }
     }

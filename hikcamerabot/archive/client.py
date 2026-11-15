@@ -1,6 +1,7 @@
-"""Hikvision NVR archive API: channel list, recordings search, playback URL."""
+"""Hikvision NVR archive API: channels, snapshot, recordings search, playback."""
 
 import logging
+import re
 import time
 from datetime import datetime
 from enum import IntEnum
@@ -11,6 +12,7 @@ from uuid import uuid4
 import httpx
 import xmltodict
 
+from hikcamerabot.archive.recordings import Recording
 from hikcamerabot.clients.hikvision.auth import DigestAuthCached
 from hikcamerabot.clients.hikvision.enums import AuthType
 from hikcamerabot.constants import CONN_TIMEOUT, XML_HEADERS
@@ -28,6 +30,10 @@ if TYPE_CHECKING:
 _CHANNELS_ENDPOINT: Final[str] = 'ISAPI/ContentMgmt/InputProxy/channels'
 _STREAMING_CHANNELS_ENDPOINT: Final[str] = 'ISAPI/Streaming/channels'
 _SEARCH_ENDPOINT: Final[str] = 'ISAPI/ContentMgmt/search'
+_PICTURE_ENDPOINT: Final[str] = 'ISAPI/Streaming/channels/{track_id}/picture'
+_SNAPSHOT_TIMEOUT: Final[float] = 15.0
+# `...&name=ch26_0001&size=1049123456`: size of the recorded file in bytes.
+_PLAYBACK_URI_SIZE_REGEX: Final[re.Pattern[str]] = re.compile(r'[?&]size=(\d+)')
 
 _CHANNELS_CACHE_TTL: Final[float] = 600.0
 _SEARCH_TIMEOUT: Final[float] = 30.0
@@ -108,23 +114,33 @@ def parse_streaming_channels(xml_text: str) -> dict[int, str]:
     return channels
 
 
-def parse_search_result(xml_text: str) -> list[tuple[datetime, datetime]]:
-    """Return time spans of found recordings from `CMSearchResult`."""
+def _parse_size(item: dict) -> int | None:
+    """Get recorded file size from `playbackURI`, if NVR reports it."""
+    descriptor = item.get('mediaSegmentDescriptor') or {}
+    match = _PLAYBACK_URI_SIZE_REGEX.search(str(descriptor.get('playbackURI') or ''))
+    return int(match[1]) if match else None
+
+
+def parse_search_result(xml_text: str) -> list[Recording]:
+    """Return found recordings from `CMSearchResult`, sorted by time."""
     root = xmltodict.parse(xml_text).get('CMSearchResult') or {}
     match_list = root.get('matchList') or {}
-    spans: list[tuple[datetime, datetime]] = []
+    recordings: list[Recording] = []
     for item in _as_list(match_list.get('searchMatchItem')):
         try:
             time_span = item['timeSpan']
-            spans.append(
-                (
-                    datetime.strptime(time_span['startTime'], _ISAPI_TIME_FORMAT),  # noqa: DTZ007
-                    datetime.strptime(time_span['endTime'], _ISAPI_TIME_FORMAT),  # noqa: DTZ007
+            recordings.append(
+                Recording(
+                    start=datetime.strptime(  # noqa: DTZ007
+                        time_span['startTime'], _ISAPI_TIME_FORMAT
+                    ),
+                    end=datetime.strptime(time_span['endTime'], _ISAPI_TIME_FORMAT),  # noqa: DTZ007
+                    size=_parse_size(item),
                 )
             )
         except (KeyError, TypeError, ValueError):
             continue
-    return sorted(spans)
+    return sorted(recordings, key=lambda rec: rec.start)
 
 
 class NvrArchiveClient:
@@ -154,6 +170,15 @@ class NvrArchiveClient:
         data: str | None = None,
         timeout: float = CONN_TIMEOUT,  # noqa: ASYNC109
     ) -> str:
+        return (await self._request_raw(method, endpoint, data, timeout)).text
+
+    async def _request_raw(
+        self,
+        method: str,
+        endpoint: str,
+        data: str | None = None,
+        timeout: float = CONN_TIMEOUT,  # noqa: ASYNC109
+    ) -> httpx.Response:
         url = urljoin(f'{self._base_url}/', endpoint)
         try:
             response = await self._session.request(
@@ -174,7 +199,21 @@ class NvrArchiveClient:
             raise APIBadResponseCodeError(
                 f'NVR returned an error: {status_code}', status_code=status_code
             )
-        return response.text
+        return response
+
+    async def get_snapshot(self, channel: int) -> bytes:
+        """Return current JPEG picture of the camera."""
+        response = await self._request_raw(
+            'GET',
+            _PICTURE_ENDPOINT.format(track_id=track_id(channel, StreamType.MAIN)),
+            timeout=_SNAPSHOT_TIMEOUT,
+        )
+        content_type = response.headers.get('content-type', '')
+        if not response.content or 'xml' in content_type or 'html' in content_type:
+            raise HikvisionAPIError(
+                f'NVR returned no picture for channel {channel}: {content_type}'
+            )
+        return response.content
 
     async def get_channels(self, force: bool = False) -> dict[int, str]:
         """Return `{channel number: name}`. Names from config have priority."""
@@ -206,8 +245,8 @@ class NvrArchiveClient:
 
     async def find_recordings(
         self, channel: int, start: datetime, end: datetime, stream: StreamType
-    ) -> list[tuple[datetime, datetime]]:
-        """Return time spans recorded in the period. Empty list - no recordings."""
+    ) -> list[Recording]:
+        """Return recordings of the period. Empty list - no recordings."""
         payload = _SEARCH_XML_TPL.format(
             search_id=str(uuid4()).upper(),
             track_id=track_id(channel, stream),

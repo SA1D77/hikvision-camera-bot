@@ -18,8 +18,17 @@ from hikcamerabot.archive.exporter import (
     ArchiveExportError,
     split_period,
 )
+from hikcamerabot.archive.recordings import (
+    Recording,
+    choose_part_seconds,
+    covered_seconds,
+    covered_spans,
+    estimate_size,
+    is_fully_covered,
+)
 from hikcamerabot.common.video.tasks.ffprobe_context import GetFfprobeContextTask
 from hikcamerabot.common.video.tasks.thumbnail import MakeThumbnailTask
+from hikcamerabot.exceptions import APIAuthError, APIConnectionError
 from hikcamerabot.utils.errors import describe_error
 from hikcamerabot.utils.file import format_bytes
 from hikcamerabot.utils.shared import gen_random_str
@@ -42,6 +51,9 @@ _STATUS_UPDATE_PERIOD: Final[float] = 15.0
 _DATE_FORMAT: Final[str] = '%d.%m.%Y'
 _TIME_FORMAT: Final[str] = '%H:%M'
 _FILENAME_FORMAT: Final[str] = '%Y-%m-%d_%H-%M'
+# `15.11.2026 13:30–13:42` -> `13:30–13:42` for spans inside one day.
+_DATE_PREFIX_LEN: Final[int] = len('15.11.2026 ')
+_MAX_SPANS_SHOWN: Final[int] = 4
 
 STREAM_NAMES: Final[dict[StreamType, str]] = {
     StreamType.MAIN: 'основной поток',
@@ -132,6 +144,95 @@ class ArchiveService:
             )
         return None
 
+    async def find_recordings(
+        self,
+        nvr_id: str,
+        channel: int,
+        start: datetime,
+        end: datetime,
+        stream: StreamType,
+    ) -> list[Recording] | None:
+        """Return recordings of the period or None if NVR can't search.
+
+        Search is a quick check before the export: some NVRs don't support
+        it, then the export is tried anyway. Connection and password errors
+        are raised: the export would fail too.
+        """
+        try:
+            recordings = await self._clients[nvr_id].find_recordings(
+                channel, start, end, stream
+            )
+        except (APIConnectionError, APIAuthError):
+            raise
+        except Exception as err:
+            self._log.warning(
+                'Archive search failed on "%s": %s: %s',
+                nvr_id,
+                err.__class__.__name__,
+                err,
+            )
+            return None
+        self._log.info(
+            'Found %d recording(s) on "%s" channel %s', len(recordings), nvr_id, channel
+        )
+        return recordings
+
+    def part_seconds(self, recordings: list[Recording] | None) -> int:
+        """Return length of one video so that it fits Telegram file limit."""
+        return choose_part_seconds(recordings, self.conf.part_minutes * 60)
+
+    def describe_availability(
+        self, recordings: list[Recording] | None, start: datetime, end: datetime
+    ) -> tuple[str, bool]:
+        """Return text about found recordings and whether export makes sense."""
+        if recordings is None:
+            return (
+                'ℹ️ Регистратор не дал проверить наличие записи заранее — '
+                'попробую выгрузить.',
+                True,
+            )
+        spans = covered_spans(recordings, start, end)
+        if not spans:
+            return '🤷 Записи за это время нет.', False
+
+        if is_fully_covered(spans, start, end):
+            lines = ['✅ Запись есть за весь отрезок.']
+        else:
+            shown = ', '.join(
+                format_period(span_start, span_end)[_DATE_PREFIX_LEN:]
+                for span_start, span_end in spans[:_MAX_SPANS_SHOWN]
+            )
+            more = ' и ещё...' if len(spans) > _MAX_SPANS_SHOWN else ''
+            recorded = format_minutes(timedelta(seconds=covered_seconds(spans)))
+            lines = [f'⚠️ Запись есть частично ({recorded}): {shown}{more}']
+
+        size = estimate_size(recordings, start, end)
+        if size:
+            lines.append(f'📏 Примерный размер: {format_bytes(size)}')
+        part = timedelta(seconds=self.part_seconds(recordings))
+        parts = len(self._parts_to_export(recordings, start, end))
+        if parts > 1:
+            lines.append(
+                f'📦 Придёт {parts} видео по {format_minutes(part)}, '
+                'каждое влезает в лимит Telegram.'
+            )
+        return '\n'.join(lines), True
+
+    def _parts_to_export(
+        self, recordings: list[Recording] | None, start: datetime, end: datetime
+    ) -> list[tuple[datetime, datetime]]:
+        """Split the period into parts, skipping parts without recordings."""
+        parts = split_period(
+            start, end, timedelta(seconds=self.part_seconds(recordings))
+        )
+        if recordings is None:
+            return parts
+        return [
+            (part_start, part_end)
+            for part_start, part_end in parts
+            if covered_spans(recordings, part_start, part_end)
+        ]
+
     def start_job(self, job: ArchiveJob) -> None:
         self._jobs[job.id] = job
         job.task = create_task(
@@ -180,7 +281,19 @@ class ArchiveService:
 
     async def _export(self, job: ArchiveJob, work_dir: Path) -> None:
         client = self._clients[job.nvr_id]
-        if not await self._has_recordings(job, client):
+        await self._set_status(job, '🔎 Ищу запись на регистраторе...')
+        recordings = await self.find_recordings(
+            job.nvr_id, job.channel, job.start, job.end, job.stream
+        )
+        if job.stream is StreamType.SUB and not recordings:
+            # Some NVRs list only main stream files: use them to know when
+            # the camera was recording. Their sizes don't fit the sub stream.
+            main = await self.find_recordings(
+                job.nvr_id, job.channel, job.start, job.end, StreamType.MAIN
+            )
+            recordings = main and [Recording(rec.start, rec.end) for rec in main]
+        parts = self._parts_to_export(recordings, job.start, job.end)
+        if not parts:
             await self._set_status(
                 job,
                 '🤷 Записей за это время нет. Проверьте номер камеры и время.',
@@ -199,9 +312,6 @@ class ArchiveService:
             )
             return
 
-        parts = split_period(
-            job.start, job.end, timedelta(minutes=self.conf.part_minutes)
-        )
         sent = 0
         for idx, (start, end) in enumerate(parts, start=1):
             part_label = f'часть {idx} из {len(parts)}' if len(parts) > 1 else ''
@@ -218,23 +328,6 @@ class ArchiveService:
                 'нет или регистратор занят. Подробности в логах бота.',
                 final=True,
             )
-
-    async def _has_recordings(self, job: ArchiveJob, client: NvrArchiveClient) -> bool:
-        await self._set_status(job, '🔎 Ищу запись на регистраторе...')
-        try:
-            spans = await client.find_recordings(
-                job.channel, job.start, job.end, job.stream
-            )
-        except Exception as err:
-            # Search is only a quick check: some NVRs don't support it.
-            self._log.warning(
-                'Archive search failed, exporting anyway: %s: %s',
-                err.__class__.__name__,
-                err,
-            )
-            return True
-        self._log.info('Found %d recording(s) for job %s', len(spans), job.id)
-        return bool(spans)
 
     async def _export_part(
         self,

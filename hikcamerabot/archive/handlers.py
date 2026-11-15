@@ -1,16 +1,20 @@
 """Telegram commands and buttons of the NVR archive export.
 
-Quick way: `/archive 26 13:30-14:00`. Guided way: `/archive` and buttons
-(NVR -> camera -> day), then the time range is sent as a text message.
+Guided way: `/archive` -> region -> NVR -> camera -> current picture of the
+camera (is it the right one?) -> day -> time range sent as a text message ->
+the bot checks that the recording exists and fits Telegram -> export.
+Quick way: `/archive 26 13:30-14:00` (the first NVR).
 All button state is kept in callback data, so it survives bot restarts.
 """
 
 import contextlib
 import logging
 from datetime import date, datetime, timedelta
+from io import BytesIO
 from typing import TYPE_CHECKING, Final
 
 from pyrogram import filters
+from pyrogram.enums import ChatAction
 from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 from pyrogram.types import (
     CallbackQuery,
@@ -46,17 +50,21 @@ CALLBACK_PREFIX: Final[str] = 'arc'
 _SEP: Final[str] = '|'
 
 ACTION_START: Final[str] = 's'
+_ACTION_GROUP: Final[str] = 'r'
 _ACTION_NVR: Final[str] = 'n'
 _ACTION_CHANNEL: Final[str] = 'c'
+_ACTION_EXPORT: Final[str] = 'e'
 _ACTION_DAY: Final[str] = 'd'
 _ACTION_GO: Final[str] = 'g'
 _ACTION_CLOSE: Final[str] = 'x'
 _ACTION_CANCEL_JOB: Final[str] = 'k'
 
+NVRS_PER_PAGE: Final[int] = 10
 CHANNELS_PER_PAGE: Final[int] = 10
-_CHANNEL_COLUMNS: Final[int] = 2
-_CHANNEL_NAME_MAX_LEN: Final[int] = 18
+_COLUMNS: Final[int] = 2
+_BUTTON_NAME_MAX_LEN: Final[int] = 18
 DAYS_TO_SHOW: Final[int] = 7
+_NO_GROUP_TITLE: Final[str] = 'Без региона'
 
 _DAY_KEY_FORMAT: Final[str] = '%Y%m%d'
 _START_KEY_FORMAT: Final[str] = '%Y%m%d%H%M'
@@ -68,11 +76,11 @@ _STREAM_CODES: Final[dict[str, StreamType]] = {
 
 HELP_TEXT: Final[str] = (
     '\n\n<b>🎞 Архив видеорегистратора</b>\n'
-    'Кнопка «🎞 Архив» или /archive — выбрать камеру, день и время кнопками.\n'
-    'Быстро одной командой: <code>/archive 26 13:30-14:00</code> — камера 26, '
-    'сегодня. С датой: <code>/archive 26 15.11 13:30-14:00</code> или '
-    '<code>/archive 26 вчера 13:30-14:00</code>.\n'
-    'Длинные записи приходят несколькими видео по частям.'
+    'Кнопка «🎞 Архив» или /archive: выберите регистратор и камеру — бот '
+    'пришлёт кадр с неё, чтобы проверить ракурс. Затем «Выгрузить запись», '
+    'день и время, например <code>13:30-14:00</code>. Бот проверит, есть ли '
+    'запись, и пришлёт видео; длинные записи приходят по частям.\n'
+    'Быстро одной командой: <code>/archive 26 13:30-14:00</code>.'
 )
 
 # Chat ID -> (NVR index, channel, day): the bot waits for a time range text.
@@ -105,29 +113,88 @@ def _user_name(user: object) -> str:
     return f'{name} (@{username})' if username else name
 
 
+def _camera_title(channel: int, name: str) -> str:
+    return f'камера {channel}' + (f' «{name}»' if name else '')
+
+
+def get_groups(service: ArchiveService) -> list[tuple[str | None, list[int]]]:
+    """Return regions in config order: `(title, NVR indexes)`."""
+    groups: dict[str | None, list[int]] = {}
+    for idx, nvr_id in enumerate(service.nvr_ids):
+        groups.setdefault(service.conf.nvrs[nvr_id].group, []).append(idx)
+    return list(groups.items())
+
+
+def _group_index(service: ArchiveService, nvr_idx: int) -> int:
+    for group_idx, (_, nvr_indexes) in enumerate(get_groups(service)):
+        if nvr_idx in nvr_indexes:
+            return group_idx
+    return 0
+
+
+def _paginate[T](items: list[T], page: int, per_page: int) -> tuple[list[T], int, int]:
+    """Return `(items of the page, page, pages)`; the page number is clamped."""
+    pages = max(1, -(-len(items) // per_page))
+    page = min(max(page, 0), pages - 1)
+    return items[page * per_page : (page + 1) * per_page], page, pages
+
+
+def _grid(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
+    return [buttons[i : i + _COLUMNS] for i in range(0, len(buttons), _COLUMNS)]
+
+
+def _pager(action: str, key: int, page: int, pages: int) -> list[InlineKeyboardButton]:
+    return [
+        _btn('◀️', action, key, (page - 1) % pages),
+        _btn(f'{page + 1} / {pages}', action, key, page),
+        _btn('▶️', action, key, (page + 1) % pages),
+    ]
+
+
 # Keyboards.
 
 
-def build_nvrs_keyboard(service: ArchiveService) -> InlineKeyboardMarkup:
-    rows = [
-        [_btn(f'🗄 {service.nvr_description(nvr_id)}', _ACTION_NVR, idx, 0)]
-        for idx, nvr_id in enumerate(service.nvr_ids)
+def build_groups_keyboard(service: ArchiveService) -> InlineKeyboardMarkup:
+    buttons = [
+        _btn(f'📍 {title or _NO_GROUP_TITLE} ({len(nvrs)})', _ACTION_GROUP, idx, 0)
+        for idx, (title, nvrs) in enumerate(get_groups(service))
     ]
-    rows.append([_close_btn()])
+    return InlineKeyboardMarkup([*_grid(buttons), [_close_btn()]])
+
+
+def build_nvrs_keyboard(
+    service: ArchiveService, group_idx: int, page: int
+) -> InlineKeyboardMarkup:
+    groups = get_groups(service)
+    nvr_indexes, page, pages = _paginate(groups[group_idx][1], page, NVRS_PER_PAGE)
+    buttons = [
+        _btn(
+            f'🗄 {service.nvr_description(service.nvr_ids[idx])}'[
+                : _BUTTON_NAME_MAX_LEN + 2
+            ],
+            _ACTION_NVR,
+            idx,
+            0,
+        )
+        for idx in nvr_indexes
+    ]
+    rows = _grid(buttons)
+    if pages > 1:
+        rows.append(_pager(_ACTION_GROUP, group_idx, page, pages))
+    last_row = [_close_btn()]
+    if len(groups) > 1:
+        last_row.insert(0, _btn('⬅️ Регионы', ACTION_START))
+    rows.append(last_row)
     return InlineKeyboardMarkup(rows)
 
 
 def build_channels_keyboard(
-    channels: dict[int, str], nvr_idx: int, page: int, show_back: bool
+    channels: dict[int, str], nvr_idx: int, page: int, back: InlineKeyboardButton | None
 ) -> InlineKeyboardMarkup:
-    items = list(channels.items())
-    pages = max(1, -(-len(items) // CHANNELS_PER_PAGE))
-    page = min(max(page, 0), pages - 1)
-    page_items = items[page * CHANNELS_PER_PAGE : (page + 1) * CHANNELS_PER_PAGE]
-
+    page_items, page, pages = _paginate(list(channels.items()), page, CHANNELS_PER_PAGE)
     buttons = [
         _btn(
-            f'{channel}. {name[:_CHANNEL_NAME_MAX_LEN]}'
+            f'{channel}. {name[:_BUTTON_NAME_MAX_LEN]}'
             if name
             else f'Камера {channel}',
             _ACTION_CHANNEL,
@@ -136,23 +203,21 @@ def build_channels_keyboard(
         )
         for channel, name in page_items
     ]
-    rows = [
-        buttons[i : i + _CHANNEL_COLUMNS]
-        for i in range(0, len(buttons), _CHANNEL_COLUMNS)
-    ]
+    rows = _grid(buttons)
     if pages > 1:
-        rows.append(
-            [
-                _btn('◀️', _ACTION_NVR, nvr_idx, (page - 1) % pages),
-                _btn(f'{page + 1} / {pages}', _ACTION_NVR, nvr_idx, page),
-                _btn('▶️', _ACTION_NVR, nvr_idx, (page + 1) % pages),
-            ]
-        )
-    last_row = [_close_btn()]
-    if show_back:
-        last_row.insert(0, _btn('⬅️ Регистраторы', ACTION_START))
-    rows.append(last_row)
+        rows.append(_pager(_ACTION_NVR, nvr_idx, page, pages))
+    rows.append([back, _close_btn()] if back else [_close_btn()])
     return InlineKeyboardMarkup(rows)
+
+
+def build_preview_keyboard(nvr_idx: int, channel: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [_btn('📥 Выгрузить запись', _ACTION_EXPORT, nvr_idx, channel)],
+            [_btn('🔄 Обновить кадр', _ACTION_CHANNEL, nvr_idx, channel)],
+            [_btn('⬅️ Камеры', _ACTION_NVR, nvr_idx, 0), _close_btn()],
+        ]
+    )
 
 
 def build_days_keyboard(
@@ -184,8 +249,17 @@ def build_confirm_keyboard(
         [
             [_btn('▶️ Выгрузить', _ACTION_GO, *args, 'm')],
             [_btn('📉 Доп. поток (меньше размер)', _ACTION_GO, *args, 's')],
-            [_btn('✖️ Отмена', _ACTION_CLOSE)],
+            [
+                _btn('🕒 Другое время', _ACTION_EXPORT, nvr_idx, channel),
+                _btn('✖️ Отмена', _ACTION_CLOSE),
+            ],
         ]
+    )
+
+
+def build_other_time_keyboard(nvr_idx: int, channel: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[_btn('🕒 Другое время', _ACTION_EXPORT, nvr_idx, channel), _close_btn()]]
     )
 
 
@@ -195,52 +269,7 @@ def build_cancel_job_keyboard(job_id: str) -> InlineKeyboardMarkup:
     )
 
 
-# Texts.
-
-_NVRS_TEXT: Final[str] = '<b>🎞 Архив</b>\nВыберите видеорегистратор:'
-
-
-def _channels_text(service: ArchiveService, nvr_id: str) -> str:
-    return (
-        f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}\n'
-        'Выберите камеру.\n\n'
-        'Быстрый способ — одной командой:\n'
-        '<code>/archive 26 13:30-14:00</code>'
-    )
-
-
-def _days_text(service: ArchiveService, nvr_id: str, channel: int, name: str) -> str:
-    title = f'камера {channel}' + (f' «{name}»' if name else '')
-    return (
-        f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}, {title}\nВыберите день:'
-    )
-
-
-def _confirm_text(
-    service: ArchiveService,
-    nvr_id: str,
-    channel: int,
-    name: str,
-    start: datetime,
-    end: datetime,
-) -> str:
-    title = f'камера {channel}' + (f' «{name}»' if name else '')
-    parts = -(-int((end - start).total_seconds()) // (service.conf.part_minutes * 60))
-    parts_note = (
-        f'\nБудет отправлено частями по {service.conf.part_minutes} мин: {parts} шт.'
-        if parts > 1
-        else ''
-    )
-    return (
-        f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}, {title}\n'
-        f'🗓 {format_period(start, end)} ({format_minutes(end - start)})'
-        f'{parts_note}\n\n'
-        'Выгрузка обычно идёт со скоростью записи: 10 минут видео — около '
-        '10 минут ожидания.'
-    )
-
-
-# Dialog steps.
+# Dialog steps: each returns text and keyboard of the panel.
 
 
 async def _channel_name(service: ArchiveService, nvr_id: str, channel: int) -> str:
@@ -252,48 +281,166 @@ async def _channel_name(service: ArchiveService, nvr_id: str, channel: int) -> s
         return ''
 
 
+def _group_step(
+    service: ArchiveService, group_idx: int, page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    title = get_groups(service)[group_idx][0]
+    region = f' — {title}' if title else ''
+    return (
+        f'<b>🎞 Архив</b>{region}\nВыберите видеорегистратор:',
+        build_nvrs_keyboard(service, group_idx, page),
+    )
+
+
 async def _nvr_step(
     service: ArchiveService, nvr_idx: int, page: int
 ) -> tuple[str, InlineKeyboardMarkup]:
     nvr_id = service.nvr_ids[nvr_idx]
+    back = (
+        _btn('⬅️ Регистраторы', _ACTION_GROUP, _group_index(service, nvr_idx), 0)
+        if len(service.nvr_ids) > 1
+        else None
+    )
     try:
         channels = await service.client(nvr_id).get_channels()
     except Exception as err:
         log.warning('Failed to get channels from "%s": %s', nvr_id, err)
-        rows = [[_btn('🔄 Повторить', _ACTION_NVR, nvr_idx, page)], [_close_btn()]]
+        rows = [
+            [_btn('🔄 Повторить', _ACTION_NVR, nvr_idx, page)],
+            [back, _close_btn()] if back else [_close_btn()],
+        ]
         return (
             f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}\n\n'
-            f'Не удалось получить список камер.\n{describe_error(err)}\n\n'
-            'Команда <code>/archive 26 13:30-14:00</code> работает и без списка.',
+            f'Не удалось получить список камер.\n{describe_error(err)}',
             InlineKeyboardMarkup(rows),
         )
-    return _channels_text(service, nvr_id), build_channels_keyboard(
-        channels, nvr_idx, page, show_back=len(service.nvr_ids) > 1
+    return (
+        f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}\n'
+        f'Камер: {len(channels)}. Выберите камеру — пришлю кадр с неё.',
+        build_channels_keyboard(channels, nvr_idx, page, back),
     )
 
 
 async def _start_step(service: ArchiveService) -> tuple[str, InlineKeyboardMarkup]:
     if len(service.nvr_ids) == 1:
         return await _nvr_step(service, 0, 0)
-    return _NVRS_TEXT, build_nvrs_keyboard(service)
+    if len(get_groups(service)) == 1:
+        return _group_step(service, 0, 0)
+    return '<b>🎞 Архив</b>\nВыберите регион:', build_groups_keyboard(service)
+
+
+async def _show(
+    bot: 'CameraBot',
+    message: Message,
+    text: str,
+    markup: InlineKeyboardMarkup,
+    keep_photo: bool = False,
+) -> None:
+    """Show the next step in the panel message.
+
+    A message with a camera picture can't be turned into a text one: a new
+    message is sent, the picture is removed unless `keep_photo` is set.
+    """
+    if not getattr(message, 'photo', None):
+        # "Message is not modified" and similar errors are not important here.
+        with contextlib.suppress(Exception):
+            await message.edit_text(text, reply_markup=markup)
+        return
+    await bot.send_message(message.chat.id, text, reply_markup=markup)
+    if not keep_photo:
+        with contextlib.suppress(Exception):
+            await message.delete()
+
+
+async def _show_preview(
+    bot: 'CameraBot', message: Message, nvr_idx: int, channel: int
+) -> None:
+    """Send current picture of the camera so the user can check it's the right one."""
+    service: ArchiveService = bot.archive
+    nvr_id = service.nvr_ids[nvr_idx]
+    title = _camera_title(channel, await _channel_name(service, nvr_id, channel))
+    header = f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}, {title}'
+    markup = build_preview_keyboard(nvr_idx, channel)
+    with contextlib.suppress(Exception):
+        await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+    try:
+        image = await service.client(nvr_id).get_snapshot(channel)
+    except Exception as err:
+        log.warning(
+            'Failed to get picture of "%s" channel %s: %s', nvr_id, channel, err
+        )
+        await _show(
+            bot,
+            message,
+            f'{header}\n\nНе удалось получить кадр с камеры.\n{describe_error(err)}\n\n'
+            'Выгрузить запись можно и без кадра.',
+            markup,
+        )
+        return
+
+    photo = BytesIO(image)
+    photo.name = f'camera_{channel}.jpg'
+    now = datetime.now().strftime('%H:%M:%S')  # noqa: DTZ005
+    await bot.send_photo(
+        message.chat.id,
+        photo,
+        caption=f'{header}\nКадр сделан сейчас, в {now}. Это нужная камера?',
+        reply_markup=markup,
+    )
+    with contextlib.suppress(Exception):
+        await message.delete()
 
 
 async def _send_confirmation(
+    bot: 'CameraBot',
     message: Message,
-    service: ArchiveService,
     nvr_idx: int,
     channel: int,
     start: datetime,
     end: datetime,
 ) -> None:
+    """Check the period on NVR and ask to confirm the export."""
+    service: ArchiveService = bot.archive
+    other_time = build_other_time_keyboard(nvr_idx, channel)
     error = service.validate_period(start, end)
     if error:
-        await message.reply_text(f'⚠️ {error}', quote=True)
+        await message.reply_text(f'⚠️ {error}', reply_markup=other_time, quote=True)
         return
+
     nvr_id = service.nvr_ids[nvr_idx]
-    name = await _channel_name(service, nvr_id, channel)
+    title = _camera_title(channel, await _channel_name(service, nvr_id, channel))
+    header = (
+        f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}, {title}\n'
+        f'🗓 {format_period(start, end)} ({format_minutes(end - start)})'
+    )
+    with contextlib.suppress(Exception):
+        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    try:
+        recordings = await service.find_recordings(
+            nvr_id, channel, start, end, StreamType.MAIN
+        )
+    except Exception as err:
+        log.warning('Archive check failed on "%s": %s', nvr_id, err)
+        await message.reply_text(
+            f'{header}\n\nНе удалось проверить запись.\n{describe_error(err)}',
+            reply_markup=other_time,
+            quote=True,
+        )
+        return
+
+    availability, exportable = service.describe_availability(recordings, start, end)
+    if not exportable:
+        await message.reply_text(
+            f'{header}\n\n{availability}\nПроверьте камеру и время.',
+            reply_markup=other_time,
+            quote=True,
+        )
+        return
     await message.reply_text(
-        _confirm_text(service, nvr_id, channel, name, start, end),
+        f'{header}\n\n{availability}\n\n'
+        'Размер указан для основного потока, доп. поток в несколько раз меньше.\n'
+        'Выгрузка обычно идёт со скоростью записи: 10 минут видео — около '
+        '10 минут ожидания.',
         reply_markup=build_confirm_keyboard(nvr_idx, channel, start, end),
         quote=True,
     )
@@ -325,7 +472,7 @@ async def cmd_archive(bot: 'CameraBot', message: Message) -> None:
         return
     # The command works with the first NVR; others are chosen with buttons.
     await _send_confirmation(
-        message, service, 0, request.channel, request.start, request.end
+        bot, message, 0, request.channel, request.start, request.end
     )
 
 
@@ -345,7 +492,7 @@ async def on_time_range_text(bot: 'CameraBot', message: Message) -> None:
         )
         return
     _pending.pop(chat_id, None)
-    await _send_confirmation(message, bot.archive, nvr_idx, channel, start, end)
+    await _send_confirmation(bot, message, nvr_idx, channel, start, end)
 
 
 def _is_waiting_for_time(_: object, __: object, message: Message) -> bool:
@@ -380,13 +527,7 @@ async def on_archive_callback(bot: 'CameraBot', query: CallbackQuery) -> None:
             await query.answer('❌ Ошибка, смотрите логи', show_alert=True)
 
 
-async def _edit(message: Message, text: str, markup: InlineKeyboardMarkup) -> None:
-    # "Message is not modified" and similar errors are not important here.
-    with contextlib.suppress(Exception):
-        await message.edit_text(text, reply_markup=markup)
-
-
-async def _process_action(  # noqa: PLR0911
+async def _process_action(  # noqa: C901, PLR0911, PLR0915
     bot: 'CameraBot',
     query: CallbackQuery,
     message: Message,
@@ -407,29 +548,49 @@ async def _process_action(  # noqa: PLR0911
         await query.answer('Отменяю...' if cancelled else 'Выгрузка уже завершена')
         return
 
-    if action == ACTION_START:
+    # Any navigation step cancels waiting for a time range.
+    if action != _ACTION_GO:
         _pending.pop(chat_id, None)
+
+    if action == ACTION_START:
         await query.answer()
-        await _edit(message, *await _start_step(service))
+        await _show(bot, message, *await _start_step(service))
+        return
+
+    if action == _ACTION_GROUP:
+        group_idx = int(args[0])
+        if not 0 <= group_idx < len(get_groups(service)):
+            raise IndexError(group_idx)
+        await query.answer()
+        await _show(bot, message, *_group_step(service, group_idx, int(args[1])))
         return
 
     nvr_idx = int(args[0])
     nvr_id = service.nvr_ids[nvr_idx]
 
     if action == _ACTION_NVR:
-        _pending.pop(chat_id, None)
         await query.answer()
-        await _edit(message, *await _nvr_step(service, nvr_idx, int(args[1])))
+        await _show(bot, message, *await _nvr_step(service, nvr_idx, int(args[1])))
         return
 
     channel = int(args[1])
     if action == _ACTION_CHANNEL:
+        await query.answer('📷 Получаю кадр с камеры...')
+        await _show_preview(bot, message, nvr_idx, channel)
+        return
+
+    title = _camera_title(channel, await _channel_name(service, nvr_id, channel))
+    header = f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}, {title}'
+
+    if action == _ACTION_EXPORT:
         await query.answer()
-        name = await _channel_name(service, nvr_id, channel)
-        await _edit(
+        # The camera picture stays in the chat above the dialog.
+        await _show(
+            bot,
             message,
-            _days_text(service, nvr_id, channel, name),
+            f'{header}\nЗа какой день нужна запись?',
             build_days_keyboard(nvr_idx, channel, datetime.now().date()),  # noqa: DTZ005
+            keep_photo=True,
         )
         return
 
@@ -437,15 +598,14 @@ async def _process_action(  # noqa: PLR0911
         day = datetime.strptime(args[2], _DAY_KEY_FORMAT).date()  # noqa: DTZ007
         _pending[chat_id] = (nvr_idx, channel, day)
         await query.answer()
-        name = await _channel_name(service, nvr_id, channel)
-        title = f'камера {channel}' + (f' «{name}»' if name else '')
-        await _edit(
+        await _show(
+            bot,
             message,
-            f'<b>🎞 Архив</b> — {service.nvr_description(nvr_id)}, {title}\n'
-            f'🗓 {day.strftime("%d.%m.%Y")}\n\n'
-            f'Теперь отправьте время сообщением. {TIME_RANGE_HINT}',
+            f'{header}\n🗓 {day.strftime("%d.%m.%Y")}\n\n'
+            f'Теперь отправьте время сообщением. {TIME_RANGE_HINT}\n'
+            f'Максимум за один раз — {format_minutes(service.max_duration)}.',
             InlineKeyboardMarkup(
-                [[_btn('⬅️ Назад', _ACTION_CHANNEL, nvr_idx, channel), _close_btn()]]
+                [[_btn('⬅️ Назад', _ACTION_EXPORT, nvr_idx, channel), _close_btn()]]
             ),
         )
         return
@@ -485,7 +645,6 @@ def setup_archive_handlers(bot: 'CameraBot') -> None:
     """Register archive handlers. Must be called before the unknown command one."""
     service: ArchiveService = bot.archive
     service.cancel_markup = build_cancel_job_keyboard
-    users = filters.user(service.allowed_users)
     bot.add_handler(
         MessageHandler(
             cmd_archive,
@@ -499,7 +658,7 @@ def setup_archive_handlers(bot: 'CameraBot') -> None:
     bot.add_handler(
         MessageHandler(
             on_time_range_text,
-            filters=users
+            filters=filters.user(service.allowed_users)
             & filters.text
             & ~filters.regex(r'^/')
             & filters.create(_is_waiting_for_time),
