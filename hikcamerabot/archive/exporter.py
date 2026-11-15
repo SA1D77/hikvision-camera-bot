@@ -1,4 +1,9 @@
-"""Record a period of NVR archive to an MP4 file with ffmpeg."""
+"""Record a period of NVR archive to an MP4 file with ffmpeg.
+
+It's done in two steps. The playback is saved as is to a Matroska file: it
+stays readable even if NVR stops sending data and ffmpeg has to be killed.
+Then the file is quickly repacked to MP4 which Telegram can play.
+"""
 
 import asyncio
 import logging
@@ -12,24 +17,38 @@ from typing import Final
 from hikcamerabot.constants import FFMPEG_BIN
 from hikcamerabot.utils.process import kill_proc, mask_secrets, start_process
 
-# Video is copied as is (no CPU load). Audio is converted to AAC because
-# cameras often use G.711 which is not allowed in MP4.
-_FFMPEG_CMD_TPL: Final[str] = (
+# NVR often keeps the connection open after the last frame: ffmpeg leaves
+# by itself when nothing comes for this time (microseconds).
+_SOCKET_TIMEOUT_US: Final[int] = 30_000_000
+# Streams are copied as is: no CPU load, nothing depends on the audio codec.
+_CAPTURE_CMD_TPL: Final[str] = (
     f'{FFMPEG_BIN} -y -loglevel error -rtsp_transport tcp '
+    f'-timeout {_SOCKET_TIMEOUT_US} '
     '-i "{url}" '
-    '-map 0:v:0 {audio} -c:v copy '
-    '-t {duration} -movflags +faststart '
+    '-map 0:v:0 {audio} -c copy '
+    '-t {duration} -f matroska '
     '"{file_path}"'
 )
-_AUDIO_ARGS: Final[str] = '-map 0:a? -c:a aac'
-# Some cameras send audio which ffmpeg can't decode: then video only.
+_CAPTURE_AUDIO_ARGS: Final[str] = '-map 0:a?'
+# Audio is converted to AAC because cameras often use G.711 which is not
+# allowed in MP4.
+_REMUX_CMD_TPL: Final[str] = (
+    f'{FFMPEG_BIN} -y -loglevel error '
+    '-i "{source}" '
+    '-map 0:v:0 {audio} -c:v copy '
+    '-movflags +faststart '
+    '"{file_path}"'
+)
+_REMUX_AUDIO_ARGS: Final[str] = '-map 0:a? -c:a aac'
+# Some cameras send audio which ffmpeg can't save: then video only.
 _NO_AUDIO_ARGS: Final[str] = '-an'
 # NVR refused the playback itself: a try without audio won't help.
 _SERVER_ERROR_MARK: Final[str] = 'Server returned'
 
 _POLL_PERIOD: Final[float] = 5.0
 # NVR sends nothing: no recording for this time or the connection is stuck.
-_STALL_TIMEOUT: Final[float] = 120.0
+_STALL_TIMEOUT: Final[float] = 60.0
+_REMUX_TIMEOUT: Final[float] = 900.0
 _ERROR_TAIL_SIZE: Final[int] = 2000
 
 type ProgressCallback = Callable[[int], Awaitable[None]]
@@ -42,11 +61,21 @@ class ArchiveExportError(Exception):
 def build_export_cmd(
     url: str, file_path: Path, duration: int, audio: bool = True
 ) -> str:
-    return _FFMPEG_CMD_TPL.format(
+    """Return the command which saves the playback to a Matroska file."""
+    return _CAPTURE_CMD_TPL.format(
         url=url,
         duration=duration,
         file_path=file_path.as_posix(),
-        audio=_AUDIO_ARGS if audio else _NO_AUDIO_ARGS,
+        audio=_CAPTURE_AUDIO_ARGS if audio else _NO_AUDIO_ARGS,
+    )
+
+
+def build_remux_cmd(source: Path, file_path: Path, audio: bool = True) -> str:
+    """Return the command which repacks the saved file to MP4."""
+    return _REMUX_CMD_TPL.format(
+        source=source.as_posix(),
+        file_path=file_path.as_posix(),
+        audio=_REMUX_AUDIO_ARGS if audio else _NO_AUDIO_ARGS,
     )
 
 
@@ -80,7 +109,7 @@ class ArchiveExporter:
 
     def __init__(self) -> None:
         self._log = logging.getLogger(self.__class__.__name__)
-        # Cameras whose audio can't be converted: exported without it at once.
+        # Cameras whose audio can't be saved: exported without it at once.
         self._no_audio_tracks: set[str] = set()
 
     async def export(
@@ -90,12 +119,26 @@ class ArchiveExporter:
         duration: int,
         on_progress: ProgressCallback | None = None,
     ) -> None:
-        """Record `duration` seconds from playback `url` to `file_path`.
+        """Record `duration` seconds from playback `url` to MP4 `file_path`.
 
         Raise `ArchiveExportError` if nothing was recorded. The process is
-        stopped when the task is cancelled. If the export with audio fails,
-        it's repeated without audio.
+        stopped when the task is cancelled.
         """
+        captured = file_path.with_suffix('.mkv')
+        try:
+            await self._capture(url, captured, duration, on_progress)
+            await self._remux(captured, file_path)
+        finally:
+            captured.unlink(missing_ok=True)
+
+    async def _capture(
+        self,
+        url: str,
+        file_path: Path,
+        duration: int,
+        on_progress: ProgressCallback | None,
+    ) -> None:
+        """Save the playback. If it fails with audio, repeat without audio."""
         track = _track_key(url)
         if track not in self._no_audio_tracks:
             try:
@@ -121,6 +164,7 @@ class ArchiveExporter:
             url=url, file_path=file_path, duration=duration, audio=audio
         )
         self._log.info('Exporting archive: %s', mask_secrets(cmd))
+        started_at = time.monotonic()
         proc = await start_process(
             cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
@@ -135,18 +179,56 @@ class ArchiveExporter:
         errors = ''
         if stderr_task.done() and not stderr_task.cancelled():
             errors = mask_secrets(stderr_task.result().decode(errors='replace'))
-        if _file_size(file_path) == 0:
+        size = _file_size(file_path)
+        if size == 0:
             raise ArchiveExportError(
                 f'ffmpeg recorded nothing (exit code {proc.returncode}): '
                 f'{errors[-_ERROR_TAIL_SIZE:].strip()}'
             )
-        if proc.returncode:
+        self._log.info(
+            'Archive saved: %d bytes in %d s, ffmpeg exit code %s',
+            size,
+            time.monotonic() - started_at,
+            proc.returncode,
+        )
+        if proc.returncode and errors.strip():
             # E.g. the recording ends earlier than requested: keep what we got.
+            self._log.info('ffmpeg said: %s', errors[-_ERROR_TAIL_SIZE:].strip())
+
+    async def _remux(self, source: Path, file_path: Path) -> None:
+        """Repack the saved file to MP4, without audio if it can't be converted."""
+        errors = ''
+        for audio in (True, False):
+            file_path.unlink(missing_ok=True)
+            returncode, errors = await self._run(
+                build_remux_cmd(source, file_path, audio=audio)
+            )
+            if returncode == 0 and _file_size(file_path) > 0:
+                return
             self._log.warning(
-                'ffmpeg exit code %s, file is kept: %s',
-                proc.returncode,
+                'Repacking to MP4 failed (audio: %s, exit code %s): %s',
+                audio,
+                returncode,
                 errors[-_ERROR_TAIL_SIZE:].strip(),
             )
+        file_path.unlink(missing_ok=True)
+        raise ArchiveExportError(
+            f'ffmpeg could not make MP4: {errors[-_ERROR_TAIL_SIZE:].strip()}'
+        )
+
+    async def _run(self, cmd: str) -> tuple[int | None, str]:
+        """Run a local ffmpeg command, return its exit code and errors."""
+        proc = await start_process(
+            cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), _REMUX_TIMEOUT)
+        except TimeoutError:
+            return None, 'timeout'
+        finally:
+            if proc.returncode is None:
+                await kill_proc(proc, signal.SIGINT, reraise=False)
+        return proc.returncode, (stderr or b'').decode(errors='replace')
 
     async def _wait(
         self,
@@ -174,7 +256,7 @@ class ArchiveExporter:
                 if on_progress:
                     await on_progress(size)
             elif now - last_growth > _STALL_TIMEOUT:
-                self._log.error('Archive export is stuck, stopping: %s', file_path)
+                self._log.warning('NVR sends nothing more, stopping: %s', file_path)
                 return
             if now > deadline:
                 self._log.error('Archive export is too long, stopping: %s', file_path)

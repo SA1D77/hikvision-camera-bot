@@ -1071,8 +1071,19 @@ def test_export_cmd_without_audio(tmp_path):
     cmd = build_export_cmd('rtsp://nvr/x', tmp_path / 'a.mp4', 60, audio=False)
     args = shlex.split(cmd)
     assert '-an' in args
-    assert '-c:a' not in args
     assert '0:a?' not in args
+    assert args[args.index('-f') + 1] == 'matroska'
+    assert args[args.index('-c') + 1] == 'copy'
+    assert '-timeout' in args
+
+    from hikcamerabot.archive.exporter import build_remux_cmd
+
+    remux = shlex.split(build_remux_cmd(tmp_path / 'a.mkv', tmp_path / 'a.mp4'))
+    assert remux[remux.index('-c:a') + 1] == 'aac'
+    assert remux[remux.index('-movflags') + 1] == '+faststart'
+    assert remux[-1] == (tmp_path / 'a.mp4').as_posix()
+    silent = build_remux_cmd(tmp_path / 'a.mkv', tmp_path / 'a.mp4', audio=False)
+    assert '-an' in shlex.split(silent)
 
 
 async def test_export_is_repeated_without_audio(tmp_path):
@@ -1087,9 +1098,12 @@ async def test_export_is_repeated_without_audio(tmp_path):
             raise ArchiveExportError('no decoder found for: none')
 
     exporter._export = fake
+    exporter._remux = AsyncMock()
     url = 'rtsp://nvr/Streaming/tracks/201?starttime=1'
     await exporter.export(url, tmp_path / 'a.mp4', 60)
     assert calls == [True, False]
+    source, target = exporter._remux.await_args.args
+    assert (source.name, target.name) == ('a.mkv', 'a.mp4')
     # The next part of the same camera goes without audio at once.
     await exporter.export(url.replace('=1', '=2'), tmp_path / 'b.mp4', 60)
     assert calls == [True, False, False]
@@ -1378,3 +1392,31 @@ async def test_days_are_marked_with_recordings(tmp_path):
 
     service.client('nvr_1').find_recordings = AsyncMock(side_effect=OSError('down'))
     assert await service.days_with_recordings('nvr_1', 6, days) == {}
+
+
+async def test_remux_is_repeated_without_audio(tmp_path):
+    from hikcamerabot.archive.exporter import ArchiveExporter, ArchiveExportError
+
+    exporter = ArchiveExporter()
+    target = tmp_path / 'a.mp4'
+    commands = []
+
+    async def run(cmd):
+        commands.append(cmd)
+        if ' -an ' in cmd:
+            target.write_bytes(b'mp4')
+            return 0, ''
+        return 1, 'no decoder'
+
+    exporter._run = run
+    await exporter._remux(tmp_path / 'a.mkv', target)
+    assert len(commands) == 2
+    assert target.read_bytes() == b'mp4'
+
+    async def broken(cmd):
+        return 1, 'boom'
+
+    exporter._run = broken
+    with pytest.raises(ArchiveExportError, match='boom'):
+        await exporter._remux(tmp_path / 'a.mkv', target)
+    assert not target.exists()

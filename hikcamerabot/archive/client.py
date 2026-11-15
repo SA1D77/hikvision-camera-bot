@@ -360,7 +360,7 @@ class NvrArchiveClient:
                 or len(recordings) >= _SEARCH_MAX_TOTAL
             ):
                 break
-        if not recordings:
+        if not recordings and max_results is None:
             # Helps to find out why NVR tells there are no recordings.
             self._log.info(
                 'No recordings on track %s for %s - %s, NVR answered: %s',
