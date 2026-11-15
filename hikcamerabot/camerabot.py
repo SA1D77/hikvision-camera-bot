@@ -7,6 +7,7 @@ import time
 from pyrogram import Client
 from pyrogram.types import BotCommand
 
+from hikcamerabot.archive.service import ArchiveService
 from hikcamerabot.config.config import main_conf
 from hikcamerabot.event_engine.dispatchers.inbound import InboundEventDispatcher
 from hikcamerabot.event_engine.dispatchers.outbound import OutboundEventDispatcher
@@ -38,6 +39,13 @@ class CameraBot(Client):
         self.startup_message_users = main_conf.telegram.startup_message_users
 
         self.cam_registry = CameraRegistry()
+        # Export of NVR recordings, enabled by `archive` config section.
+        archive_conf = main_conf.archive
+        self.archive: ArchiveService | None = (
+            ArchiveService(bot=self, conf=archive_conf)
+            if archive_conf and archive_conf.enabled
+            else None
+        )
         self.inbound_dispatcher = InboundEventDispatcher(bot=self)
         self.outbound_dispatcher = OutboundEventDispatcher(bot=self)
         self.result_worker_manager = ResultWorkerManager(self.outbound_dispatcher)
@@ -99,6 +107,10 @@ class CameraBot(Client):
             BotCommand('help', 'Справка'),
             BotCommand('version', 'Версия бота'),
         ]
+        if self.archive:
+            commands.insert(
+                1, BotCommand('archive', 'Запись с видеорегистратора за время')
+            )
         try:
             await self.set_bot_commands(commands)
         except Exception:

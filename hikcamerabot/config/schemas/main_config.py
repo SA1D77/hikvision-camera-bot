@@ -251,9 +251,44 @@ class TelegramSchema(StrictBaseModel):
     startup_message_users: list[int]
 
 
+class ArchiveNvrSchema(StrictBaseModel):
+    """NVR (or DVR) with recordings which can be exported to Telegram."""
+
+    description: str
+    host: str
+    port: IntMin1 = 80
+    rtsp_port: IntMin1 = 554
+    auth: CamAPIAuthSchema
+    # Own camera names, e.g. {"26": "Склад"}. By default names are read from NVR.
+    channels: dict[Annotated[str, Field(pattern=r'^[1-9]\d*$')], str] = Field(
+        default_factory=dict
+    )
+
+
+class ArchiveSchema(StrictBaseModel):
+    """Export of NVR recordings (`/archive`). The whole section is optional."""
+
+    enabled: bool = True
+    # Files are kept here only while they are exported and sent.
+    storage_path: Path = Path('/data/archive')
+    max_duration_minutes: IntMin1 = 120
+    # Long periods are sent as several videos of this length.
+    part_minutes: IntMin1 = 15
+    # Who may export the archive. Empty list - all `chat_users`.
+    users: list[int] = Field(default_factory=list)
+    nvrs: dict[Annotated[str, Field(pattern=r'^[a-z0-9_]+$')], ArchiveNvrSchema]
+
+    @model_validator(mode='after')
+    def validate_nvrs(self) -> Self:
+        if self.enabled and not self.nvrs:
+            raise ValueError('At least one NVR must be set in "archive.nvrs"')
+        return self
+
+
 class MainConfigSchema(StrictBaseModel):
     telegram: TelegramSchema
     log_level: PythonLogLevel
+    archive: ArchiveSchema | None = None
     camera_list: dict[
         Annotated[str, Field(pattern=CMD_CAM_ID_REGEX)], CameraConfigSchema
     ]

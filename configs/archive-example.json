@@ -1,0 +1,25 @@
+{
+  "archive": {
+    "enabled": true,
+    "storage_path": "/data/archive",
+    "max_duration_minutes": 120,
+    "part_minutes": 15,
+    "users": [],
+    "nvrs": {
+      "nvr_1": {
+        "description": "Офис",
+        "host": "http://192.168.1.10",
+        "port": 80,
+        "rtsp_port": 554,
+        "auth": {
+          "user": "archive-bot",
+          "password": "dummy-password",
+          "type": "digest"
+        },
+        "channels": {
+          "26": "Склад, ворота"
+        }
+      }
+    }
+  }
+}

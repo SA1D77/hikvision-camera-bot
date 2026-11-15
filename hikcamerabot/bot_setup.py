@@ -6,6 +6,7 @@ from collections.abc import Callable
 from pyrogram import filters
 from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 
+from hikcamerabot.archive.handlers import setup_archive_handlers
 from hikcamerabot.callbacks import cmd_list_group_cams, cmd_unknown
 from hikcamerabot.camera import HikvisionCam
 from hikcamerabot.camerabot import CameraBot
@@ -66,6 +67,8 @@ class BotSetup:
         self._setup_global_cmds(global_cmds)
         self._setup_group_cmds()
         self._setup_menu_callbacks()
+        if self._bot.archive:
+            setup_archive_handlers(self._bot)
         self._setup_unknown_command_handler()
         self._log.debug('Camera Meta Registry: %r', self._bot.cam_registry)
 

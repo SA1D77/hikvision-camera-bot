@@ -23,7 +23,9 @@ from pyrogram.types import (
 )
 
 import hikcamerabot.callbacks as cb
+from hikcamerabot.archive import handlers as archive_handlers
 from hikcamerabot.clients.hikvision.enums import IrcutFilterType
+from hikcamerabot.config.config import main_conf
 from hikcamerabot.config.schemas.main_config import AlertSchema, DetectionSchema
 from hikcamerabot.config.state import StateStore
 from hikcamerabot.config.store import ConfigStore
@@ -47,8 +49,16 @@ _ARG_SEP: Final[str] = ':'
 
 # Text of the persistent reply keyboard button that opens the panel.
 MENU_BUTTON_TEXT: Final[str] = '📋 Меню'
+ARCHIVE_ENABLED: Final[bool] = bool(main_conf.archive and main_conf.archive.enabled)
 MENU_REPLY_KEYBOARD: Final[ReplyKeyboardMarkup] = ReplyKeyboardMarkup(
-    [[KeyboardButton(MENU_BUTTON_TEXT)]],
+    [
+        [KeyboardButton(MENU_BUTTON_TEXT)]
+        + (
+            [KeyboardButton(archive_handlers.ARCHIVE_BUTTON_TEXT)]
+            if ARCHIVE_ENABLED
+            else []
+        )
+    ],
     is_persistent=True,
     resize_keyboard=True,
 )
@@ -197,8 +207,25 @@ def build_cameras_keyboard(bot: 'CameraBot') -> InlineKeyboardMarkup:
         [_btn(f'📹 {cam.description} ({cam.id})', _ACTION_CAMERA, cam.id)]
         for cam in bot.cam_registry.get_instances()
     ]
+    rows.extend(_archive_rows())
     rows.append([_btn('🤖 Статус', _ACTION_STATUS), _btn('✖️', _ACTION_CLOSE)])
     return InlineKeyboardMarkup(rows)
+
+
+def _archive_rows() -> list[list[InlineKeyboardButton]]:
+    """Button which turns the panel into the NVR archive dialog."""
+    if not ARCHIVE_ENABLED:
+        return []
+    return [
+        [
+            InlineKeyboardButton(
+                '🎞 Архив регистратора',
+                callback_data=archive_handlers.make_callback_data(
+                    archive_handlers.ACTION_START
+                ),
+            )
+        ]
+    ]
 
 
 _CAMERAS_TEXT: Final[str] = '<b>📹 Камеры</b>\nВыберите камеру:'
@@ -249,6 +276,9 @@ def build_camera_keyboard(
     if _is_settings_visible(cam):
         last_row.insert(0, _btn('⚙️ Настройки', _ACTION_SETTINGS, cam_id))
     rows.append(last_row)
+    if not show_back:
+        # The only camera: there is no cameras list to put the button on.
+        rows.extend(_archive_rows())
     nav_row = [_btn('✖️ Закрыть', _ACTION_CLOSE)]
     if show_back:
         nav_row.insert(0, _btn('⬅️ Камеры', _ACTION_CAMERAS))
@@ -364,7 +394,8 @@ def _status_keyboard(back_cam_id: str) -> InlineKeyboardMarkup:
 
 async def cmd_start(bot: 'CameraBot', message: Message) -> None:  # noqa: ARG001
     """Send help message (`/start`, `/help`) and show the persistent menu button."""
-    await message.reply_text(cb.HELP_TEXT, reply_markup=MENU_REPLY_KEYBOARD, quote=True)
+    text = cb.HELP_TEXT + (archive_handlers.HELP_TEXT if ARCHIVE_ENABLED else '')
+    await message.reply_text(text, reply_markup=MENU_REPLY_KEYBOARD, quote=True)
 
 
 @authorization_check

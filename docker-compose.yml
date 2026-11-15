@@ -16,6 +16,7 @@ services:
     volumes:
       - "/data/dvr:/data/dvr"                # The first path is a real local storage path e.g., "D:\Videos" in Windows. Change to your preferred one.
       - "/data/timelapses:/data/timelapses"  # The first path is a real local storage path e.g., "D:\Timelapses" in Windows. Change to your preferred one.
+      - "/data/archive:/data/archive"        # Temporary files of NVR archive export (`archive` section in config).
       - "./configs:/app/configs"
     # Short video clips are recorded to /tmp before sending: keep them in RAM
     # to reduce SD card wear. Increase size if you store more in /tmp.

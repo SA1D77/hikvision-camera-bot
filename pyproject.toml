@@ -1,6 +1,6 @@
 [project]
 name = "hikvision-camera-bot"
-version = "2.1.0"
+version = "2.2.0"
 description = "Telegram Bot which sends snapshots from your Hikvision cameras"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -81,6 +81,7 @@ ignore = [
     "ANN",
     "ARG001",
     "D",
+    "DTZ",
     "INP001",
     "PLC0415",
     "PLR0402",

@@ -2,7 +2,7 @@
 
 Telegram Bot which sends snapshots from your Hikvision cameras.
 
-Version: 2.1.0. [Release details](releases/release_2.1.md).
+Version: 2.2.0. [Release details](releases/release_2.2.md).
 
 > Runs on Raspberry Pi 4/5 (64-bit OS) with Docker. Russian guide: [docs/RASPBERRY_PI_RU.md](docs/RASPBERRY_PI_RU.md).
 
@@ -17,6 +17,7 @@ Version: 2.1.0. [Release details](releases/release_2.1.md).
 7. Theoretically, Hikvision doorbells also should be supported.
 8. Inline button menu (`/menu`) and bot/host status (`/status`): CPU temperature, RAM, free disk space.
 9. Alerts about low disk space and CPU overheating (useful for Raspberry Pi with SD card).
+10. NVR archive export: `/archive 26 13:30-14:00` sends the recording of a camera for the given time ([guide in Russian](docs/NVR_ARCHIVE_RU.md)).
 
 > Rewound video is a video that starts from the moment of the alert and goes back in time for a specified period.
 > It's useful when you want to see what happened before the alert or during manual request.

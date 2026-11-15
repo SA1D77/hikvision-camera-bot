@@ -59,6 +59,9 @@ def get_storage_paths(bot: 'CameraBot') -> list[Path]:
                 Path(conf.video_gif.on_alert.tmp_storage),
             )
         )
+    archive = getattr(bot, 'archive', None)
+    if archive:
+        paths.append(Path(archive.conf.storage_path))
     paths.append(_ROOT_PATH)
     return unique_filesystems(paths)
 
