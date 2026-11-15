@@ -982,16 +982,19 @@ def test_format_days_and_depth_report():
         now,
     )
     assert 'от 14 до 31 день' in report
-    assert 'Самая ранняя запись: 15.10.2026' in report
+    assert '(с 15.10.2026)' in report
     assert 'Камер с записью: 2 из 4' in report
-    assert '1. Вход — 31 день (с 15.10)' in report
-    assert '3. — ❌ записи нет' in report
-    assert '4. Касса — ⚠️ не удалось проверить' in report
+    assert ' 1  Вход              31  15.10' in report
+    assert ' 3  Камера 3           —  нет' in report
+    assert ' 4  Касса              ?  ошибка' in report
+    assert '• 3. Камера 3 — записей нет' in report
+    assert '• 4. Касса — не удалось проверить' in report
 
     same = format_depth_report(
         [ChannelDepth(1, 'Вход', oldest=datetime(2026, 10, 15, 3, 0))], now
     )
-    assert 'Запись хранится <b>31 день</b>' in same
+    assert 'Хранится: <b>31 день</b>' in same
+    assert 'Требуют внимания' not in same
     assert 'Записей не найдено' in format_depth_report([ChannelDepth(1, '')], now)
 
 
@@ -1022,11 +1025,11 @@ async def test_depth_button_shows_report(tmp_path):
     await handlers.on_archive_callback(bot, query)
     text = query.message.edit_text.await_args.args[0]
     assert 'Глубина архива' in text
-    assert '1. Вход — 30 дней' in text
+    assert ' 1  Вход              30' in text
     assert 'за сутки записи нет, последняя 10.06.2026 14:22' in text
     assert 'Часы регистратора: 10.06.2026 15:00' in text
     assert 'отличаются от часов бота' in text
-    assert 'За последние сутки писались: 0 из 2' in text
+    assert 'Писались за последние сутки: 0 из 2' in text
     assert '2. Склад — ⚠️ не удалось проверить' in text
 
     client.get_channels = AsyncMock(side_effect=APIAuthError('403', status_code=403))
@@ -1169,7 +1172,8 @@ async def test_other_date_button_waits_for_date_and_time(tmp_path, monkeypatch):
     message.reply_text = AsyncMock()
     await handlers.on_time_range_text(bot, message)
     assert handlers._pending == {1: (0, 27, date(2026, 10, 13))}
-    assert 'Запись есть: 30 мин' in message.reply_text.await_args.args[0]
+    assert 'Записано <b>30 мин</b>' in message.reply_text.await_args.args[0]
+    assert '13 октября 2026, вторник' in message.reply_text.await_args.args[0]
 
 
 @requires_config
@@ -1330,23 +1334,23 @@ async def test_day_shows_hours_and_hour_button_asks_to_confirm(tmp_path, monkeyp
     query = _query(f'arc|d|0|6|{day.strftime("%Y%m%d")}')
     await handlers.on_archive_callback(bot, query)
     args = query.message.edit_text.await_args
-    assert 'Запись есть: 1 ч 5 мин' in args.args[0]
-    assert '09:00–10:00, 14:00–14:05' in args.args[0]
+    assert 'Записано <b>1 ч 5 мин</b> · с 09:00 до 14:05' in args.args[0]
+    assert '00–12 ' + '░' * 18 + '██' + '░' * 4 in args.args[0]
+    assert '12–24 ' + '░' * 4 + '▒' + '░' * 19 in args.args[0]
     buttons = {
         btn.text: btn.callback_data
         for row in args.kwargs['reply_markup'].inline_keyboard
         for btn in row
     }
-    assert len([text for text in buttons if text[:2].isdigit()]) == 24
-    assert buttons['09 🟩'] == f'arc|t|0|6|{day.strftime("%Y%m%d")}09'
-    assert buttons['14 🟨'].startswith('arc|t|')
-    assert buttons['03 ⬜'].startswith('arc|z|')
+    # Only hours with recordings are offered.
+    assert [text for text in buttons if text[:2].isdigit()] == ['09:00', '14:00']
+    assert buttons['09:00'] == f'arc|t|0|6|{day.strftime("%Y%m%d")}09'
 
-    empty = _query(buttons['03 ⬜'])
+    empty = _query(f'arc|z|0|6|{day.strftime("%Y%m%d")}03')
     await handlers.on_archive_callback(bot, empty)
     assert 'записи нет' in empty.answer.await_args.args[0]
 
-    hour = _query(buttons['09 🟩'])
+    hour = _query(buttons['09:00'])
     hour.message.reply_text = AsyncMock()
     await handlers.on_archive_callback(bot, hour)
     text = hour.message.reply_text.await_args.args[0]
@@ -1370,7 +1374,7 @@ async def test_days_are_marked_with_recordings(tmp_path):
 
     markup = handlers.build_days_keyboard(0, 6, TODAY, marks)
     texts = [btn.text for row in markup.inline_keyboard for btn in row]
-    assert texts[:3] == ['Сегодня ✅', 'Вчера ❌', '13.11 пт']
+    assert texts[:3] == ['Сегодня ●', 'Вчера ○', '13.11 пт']
 
     service.client('nvr_1').find_recordings = AsyncMock(side_effect=OSError('down'))
     assert await service.days_with_recordings('nvr_1', 6, days) == {}

@@ -26,10 +26,10 @@ from pyrogram.types import (
 
 from hikcamerabot.archive.client import StreamType
 from hikcamerabot.archive.recordings import (
+    coverage_bar,
     covered_seconds,
     covered_spans,
     hour_coverage,
-    join_close_spans,
 )
 from hikcamerabot.archive.service import (
     STREAM_NAMES,
@@ -41,7 +41,6 @@ from hikcamerabot.archive.service import (
 )
 from hikcamerabot.archive.timeparse import (
     DAY_AND_TIME_HINT,
-    TIME_RANGE_HINT,
     ArchiveInputError,
     parse_day,
     parse_day_and_time_range,
@@ -81,12 +80,34 @@ _NO_GROUP_TITLE: Final[str] = 'Без региона'
 
 _DAY_KEY_FORMAT: Final[str] = '%Y%m%d'
 _HOUR_KEY_FORMAT: Final[str] = '%Y%m%d%H'
-_HOURS_IN_ROW: Final[int] = 6
-# An hour is shown as fully recorded from this number of seconds.
-_FULL_HOUR_SECONDS: Final[int] = 55 * 60
-_TIMELINE_SPANS_SHOWN: Final[int] = 16
-_TIMELINE_JOIN_GAP: Final[timedelta] = timedelta(minutes=1)
-_HOUR_FULL, _HOUR_PART, _HOUR_EMPTY = '🟩', '🟨', '⬜'
+_HOURS_IN_ROW: Final[int] = 4
+# The day is drawn as two lines of half-hour cells.
+_BAR_CELL: Final[timedelta] = timedelta(minutes=30)
+_BAR_CELLS_IN_LINE: Final[int] = 24
+_DAY_HAS_RECORDS, _DAY_NO_RECORDS = '●', '○'
+_MONTHS: Final[tuple[str, ...]] = (
+    'января',
+    'февраля',
+    'марта',
+    'апреля',
+    'мая',
+    'июня',
+    'июля',
+    'августа',
+    'сентября',
+    'октября',
+    'ноября',
+    'декабря',
+)
+_WEEKDAYS_FULL: Final[tuple[str, ...]] = (
+    'понедельник',
+    'вторник',
+    'среда',
+    'четверг',
+    'пятница',
+    'суббота',
+    'воскресенье',
+)
 _START_KEY_FORMAT: Final[str] = '%Y%m%d%H%M'
 _WEEKDAYS: Final[tuple[str, ...]] = ('пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс')
 _STREAM_CODES: Final[dict[str, StreamType]] = {
@@ -263,7 +284,7 @@ def build_days_keyboard(
         else:
             text = f'{day.strftime("%d.%m")} {_WEEKDAYS[day.weekday()]}'
         if marks and day in marks:
-            text += ' ✅' if marks[day] else ' ❌'
+            text += f' {_DAY_HAS_RECORDS if marks[day] else _DAY_NO_RECORDS}'
         buttons.append(
             _btn(text, _ACTION_DAY, nvr_idx, channel, day.strftime(_DAY_KEY_FORMAT))
         )
@@ -276,23 +297,16 @@ def build_days_keyboard(
 def build_hours_keyboard(
     nvr_idx: int, channel: int, day: date, seconds_by_hour: list[float], now: datetime
 ) -> InlineKeyboardMarkup:
-    """24 hours of the day: a press asks to export the hour."""
+    """Hours of the day which have recordings: a press asks to export the hour."""
     buttons = []
     for hour, seconds in enumerate(seconds_by_hour):
         start = datetime.combine(day, dt_time(hour))
-        if start >= now:
-            break
-        if seconds >= _FULL_HOUR_SECONDS:
-            mark = _HOUR_FULL
-        elif seconds > 0:
-            mark = _HOUR_PART
-        else:
-            mark = _HOUR_EMPTY
-        action = _ACTION_HOUR if seconds > 0 else _ACTION_NO_RECORD
+        if seconds <= 0 or start >= now:
+            continue
         buttons.append(
             _btn(
-                f'{hour:02d} {mark}',
-                action,
+                f'{hour:02d}:00',
+                _ACTION_HOUR,
                 nvr_idx,
                 channel,
                 start.strftime(_HOUR_KEY_FORMAT),
@@ -303,6 +317,14 @@ def build_hours_keyboard(
     ]
     rows.append([_btn('⬅️ Дни', _ACTION_EXPORT, nvr_idx, channel), _close_btn()])
     return InlineKeyboardMarkup(rows)
+
+
+def _format_day(day: date) -> str:
+    """Return `13 ноября 2026, пятница`."""
+    return (
+        f'{day.day} {_MONTHS[day.month - 1]} {day.year}, '
+        f'{_WEEKDAYS_FULL[day.weekday()]}'
+    )
 
 
 def build_confirm_keyboard(
@@ -374,7 +396,7 @@ async def _depth_step(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Tell how many days of recordings NVR keeps."""
     nvr_id = service.nvr_ids[nvr_idx]
-    header = f'<b>💾 Глубина архива</b> — {service.nvr_description(nvr_id)}'
+    header = f'<b>Глубина архива</b> · {service.nvr_description(nvr_id)}'
     markup = InlineKeyboardMarkup(
         [
             [_btn('🔄 Обновить', _ACTION_DEPTH, nvr_idx)],
@@ -392,8 +414,8 @@ async def _depth_step(
     now = datetime.now()  # noqa: DTZ005
     clock = await service.describe_clock(nvr_id)
     return (
-        f'{header}\n{format_depth_report(depths, now)}\n\n'
-        f'{clock}\nПроверено {now.strftime("%d.%m.%Y %H:%M")}',
+        f'{header}\n\n{format_depth_report(depths, now)}\n\n'
+        f'{clock}\nПроверено: {now.strftime("%d.%m.%Y %H:%M")}',
         markup,
     )
 
@@ -426,15 +448,15 @@ async def _nvr_step(
 async def _day_step(
     service: ArchiveService, nvr_idx: int, channel: int, day: date, header: str
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Show when the camera was recorded during the day, hour by hour."""
+    """Show when the camera was recorded during the day."""
     nvr_id = service.nvr_ids[nvr_idx]
     now = datetime.now()  # noqa: DTZ005
     day_start = datetime.combine(day, dt_time.min)
     day_end = day_start + timedelta(days=1)
-    title = f'{header}\n🗓 {day.strftime("%d.%m.%Y")}, {_WEEKDAYS[day.weekday()]}'
+    title = f'{header}\n<b>{_format_day(day)}</b>'
     type_hint = (
-        f'отправьте время сообщением. {TIME_RANGE_HINT}\n'
-        f'Максимум за один раз — {format_minutes(service.max_duration)}.'
+        'отправьте время сообщением, например <code>13:30-14:00</code>.\n'
+        f'За один раз — до {format_minutes(service.max_duration)}.'
     )
     back = InlineKeyboardMarkup(
         [[_btn('⬅️ Дни', _ACTION_EXPORT, nvr_idx, channel), _close_btn()]]
@@ -461,22 +483,23 @@ async def _day_step(
     if not spans:
         day_info = await service.describe_day(nvr_id, channel, day_start)
         return (
-            f'{title}\n\n🤷 {day_info}\n\nВыберите другой день или {type_hint}',
+            f'{title}\n\n{day_info}\n\nВыберите другой день или {type_hint}',
             back,
         )
 
-    shown = join_close_spans(spans, _TIMELINE_JOIN_GAP)
-    spans_text = ', '.join(
-        format_period(span_start, span_end).split(' ', maxsplit=1)[1]
-        for span_start, span_end in shown[:_TIMELINE_SPANS_SHOWN]
-    )
-    if len(shown) > _TIMELINE_SPANS_SHOWN:
-        spans_text += f' и ещё {len(shown) - _TIMELINE_SPANS_SHOWN}'
     recorded = format_minutes(timedelta(seconds=covered_seconds(spans)))
+    first, last = spans[0][0].strftime('%H:%M'), spans[-1][1].strftime('%H:%M')
+    half_day = _BAR_CELL * _BAR_CELLS_IN_LINE
+    bar = '\n'.join(
+        f'{label} {coverage_bar(recordings, start, _BAR_CELLS_IN_LINE, _BAR_CELL)}'
+        for label, start in (('00–12', day_start), ('12–24', day_start + half_day))
+    )
     return (
-        f'{title}\n\n🎞 Запись есть: {recorded}\n{spans_text}\n\n'
-        f'{_HOUR_FULL} весь час · {_HOUR_PART} частично · {_HOUR_EMPTY} нет записи\n'
-        f'Нажмите на час или {type_hint}',
+        f'{title}\n\n'
+        f'Записано <b>{recorded}</b> · с {first} до {last}\n\n'
+        f'<code>{bar}</code>\n'
+        '█ запись   ▒ частично   ░ нет\n\n'
+        f'Выберите час кнопкой или {type_hint}',
         build_hours_keyboard(
             nvr_idx, channel, day, hour_coverage(recordings, day_start), now
         ),
@@ -786,7 +809,7 @@ async def _process_action(  # noqa: C901, PLR0911, PLR0912, PLR0915
             bot,
             message,
             f'{header}\nЗа какой день нужна запись?\n'
-            '✅ — запись за день есть, ❌ — нет.',
+            f'{_DAY_HAS_RECORDS} запись есть   {_DAY_NO_RECORDS} записи нет',
             build_days_keyboard(
                 nvr_idx,
                 channel,

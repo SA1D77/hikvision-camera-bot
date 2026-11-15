@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import html
 import logging
 import shutil
 import time
@@ -57,7 +58,7 @@ _DATE_PREFIX_LEN: Final[int] = len('15.11.2026 ')
 _MAX_SPANS_SHOWN: Final[int] = 4
 # Cameras asked for the oldest recording at once: NVRs are slow devices.
 _DEPTH_CONCURRENCY: Final[int] = 4
-_DEPTH_NAME_MAX_LEN: Final[int] = 22
+_DEPTH_NAME_MAX_LEN: Final[int] = 14
 _DEPTH_MAX_LINES: Final[int] = 70
 _DAY_SPANS_SHOWN: Final[int] = 12
 _DAYS_CHECK_TIMEOUT: Final[float] = 12.0
@@ -114,7 +115,7 @@ def depth_days(oldest: datetime, now: datetime) -> int:
     return max((now.date() - oldest.date()).days, 0)
 
 
-def format_depth_report(  # noqa: C901, PLR0912
+def format_depth_report(  # noqa: C901
     depths: list[ChannelDepth], now: datetime
 ) -> str:
     """Return text: how many days of recordings NVR keeps, per camera too."""
@@ -122,45 +123,50 @@ def format_depth_report(  # noqa: C901, PLR0912
         return 'На регистраторе нет камер.'
     recorded = [item.oldest for item in depths if item.oldest]
     if not recorded:
-        lines = ['🤷 Записей не найдено ни по одной камере.']
+        lines = ['Записей не найдено ни по одной камере.']
     else:
         days = [depth_days(oldest, now) for oldest in recorded]
-        if min(days) == max(days):
-            lines = [f'💾 Запись хранится <b>{format_days(max(days))}</b>']
-        else:
-            lines = [
-                f'💾 Запись хранится <b>от {min(days)} до {format_days(max(days))}</b> '
-                '(зависит от камеры)'
-            ]
-        lines.append(f'Самая ранняя запись: {min(recorded).strftime(_DATE_FORMAT)}')
-        lines.append(f'Камер с записью: {len(recorded)} из {len(depths)}')
+        kept = (
+            format_days(max(days))
+            if min(days) == max(days)
+            else f'от {min(days)} до {format_days(max(days))}'
+        )
+        lines = [
+            f'Хранится: <b>{kept}</b> (с {min(recorded).strftime(_DATE_FORMAT)})',
+            f'Камер с записью: {len(recorded)} из {len(depths)}',
+        ]
         checked = [item for item in depths if item.recent is not None]
         if checked:
             recent = sum(1 for item in checked if item.recent)
-            mark = '✅' if recent == len(depths) else '⚠️'
-            lines.append(
-                f'{mark} За последние сутки писались: {recent} из {len(depths)}'
-            )
-    lines.append('')
+            lines.append(f'Писались за последние сутки: {recent} из {len(depths)}')
+
+    rows = [f'{"№":>2}  {"Камера":<{_DEPTH_NAME_MAX_LEN}}  {"Дней":>4}  С']
+    notes = []
     for item in depths[:_DEPTH_MAX_LINES]:
-        name = f' {item.name[:_DEPTH_NAME_MAX_LEN]}' if item.name else ''
+        name = item.name or f'Камера {item.channel}'
+        title = f'{item.channel}. {html.escape(name)}'
         if item.oldest:
-            value = (
-                f'{format_days(depth_days(item.oldest, now))} '
-                f'(с {item.oldest.strftime("%d.%m")})'
-            )
+            days_text = str(depth_days(item.oldest, now))
+            since = item.oldest.strftime('%d.%m')
             if item.recent is False:
-                value += ' ⚠️ за сутки записи нет'
+                note = f'• {title} — за сутки записи нет'
                 if item.newest:
                     last = item.newest.strftime(f'{_DATE_FORMAT} {_TIME_FORMAT}')
-                    value += f', последняя {last}'
+                    note += f', последняя {last}'
+                notes.append(note)
         elif item.error:
-            value = '⚠️ не удалось проверить'
+            days_text, since = '?', 'ошибка'
+            notes.append(f'• {title} — не удалось проверить')
         else:
-            value = '❌ записи нет'
-        lines.append(f'{item.channel}.{name} — {value}')
+            days_text, since = '—', 'нет'
+            notes.append(f'• {title} — записей нет')
+        short_name = html.escape(f'{name[:_DEPTH_NAME_MAX_LEN]:<{_DEPTH_NAME_MAX_LEN}}')
+        rows.append(f'{item.channel:>2}  {short_name}  {days_text:>4}  {since}')
     if len(depths) > _DEPTH_MAX_LINES:
-        lines.append(f'… и ещё {len(depths) - _DEPTH_MAX_LINES}')
+        rows.append(f'… и ещё {len(depths) - _DEPTH_MAX_LINES}')
+    lines += ['', '<pre>' + '\n'.join(rows) + '</pre>']
+    if notes:
+        lines += ['', '<b>Требуют внимания</b>', *notes]
     return '\n'.join(lines)
 
 
@@ -398,11 +404,16 @@ class ArchiveService:
         except Exception as err:
             self._log.warning('Failed to get time of "%s": %s', nvr_id, err)
             return ''
-        text = f'🕒 Часы регистратора: {nvr_time.strftime(f"{_DATE_FORMAT} {_TIME_FORMAT}")}'
+        text = (
+            f'Часы регистратора: {nvr_time.strftime(f"{_DATE_FORMAT} {_TIME_FORMAT}")}'
+        )
         diff = abs(nvr_time - datetime.now())  # noqa: DTZ005
         if diff > _CLOCK_MAX_DIFF:
+            difference = (
+                format_days(diff.days) if diff.days > 1 else format_minutes(diff)
+            )
             text += (
-                f'\n⚠️ Они отличаются от часов бота на {format_minutes(diff)}: '
+                f'\nОни отличаются от часов бота на {difference}: '
                 'записи ищутся по часам регистратора.'
             )
         return text

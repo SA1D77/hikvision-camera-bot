@@ -11,6 +11,7 @@ MIN_PART_SECONDS: Final[int] = 60
 # Small gaps between recorded files are normal.
 _MERGE_GAP: Final[timedelta] = timedelta(seconds=5)
 FULL_COVERAGE_RATIO: Final[float] = 0.98
+_BAR_FULL_RATIO: Final[float] = 0.9
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,25 @@ def hour_coverage(recordings: list[Recording], day_start: datetime) -> list[floa
         end = start + timedelta(hours=1)
         result.append(covered_seconds(covered_spans(recordings, start, end)))
     return result
+
+
+def coverage_bar(
+    recordings: list[Recording], start: datetime, cells: int, cell: timedelta
+) -> str:
+    """Return a text bar: `█` recorded, `▒` partly recorded, `░` nothing."""
+    bar = []
+    for idx in range(cells):
+        cell_start = start + cell * idx
+        seconds = covered_seconds(
+            covered_spans(recordings, cell_start, cell_start + cell)
+        )
+        if seconds >= cell.total_seconds() * _BAR_FULL_RATIO:
+            bar.append('█')
+        elif seconds > 0:
+            bar.append('▒')
+        else:
+            bar.append('░')
+    return ''.join(bar)
 
 
 def join_close_spans(
