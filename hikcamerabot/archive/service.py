@@ -54,6 +54,10 @@ _FILENAME_FORMAT: Final[str] = '%Y-%m-%d_%H-%M'
 # `15.11.2026 13:30–13:42` -> `13:30–13:42` for spans inside one day.
 _DATE_PREFIX_LEN: Final[int] = len('15.11.2026 ')
 _MAX_SPANS_SHOWN: Final[int] = 4
+# Cameras asked for the oldest recording at once: NVRs are slow devices.
+_DEPTH_CONCURRENCY: Final[int] = 4
+_DEPTH_NAME_MAX_LEN: Final[int] = 22
+_DEPTH_MAX_LINES: Final[int] = 70
 
 STREAM_NAMES: Final[dict[StreamType, str]] = {
     StreamType.MAIN: 'основной поток',
@@ -75,6 +79,67 @@ def format_minutes(delta: timedelta) -> str:
     if hours and minutes:
         return f'{hours} ч {minutes} мин'
     return f'{hours} ч' if hours else f'{minutes} мин'
+
+
+def format_days(days: int) -> str:
+    """Return `1 день`, `3 дня`, `31 день`, `45 дней`."""
+    if days % 10 == 1 and days % 100 != 11:  # noqa: PLR2004
+        word = 'день'
+    elif days % 10 in (2, 3, 4) and days % 100 not in (12, 13, 14):
+        word = 'дня'
+    else:
+        word = 'дней'
+    return f'{days} {word}'
+
+
+@dataclass(frozen=True)
+class ChannelDepth:
+    """The oldest recording of one camera."""
+
+    channel: int
+    name: str
+    oldest: datetime | None = None
+    error: str | None = None
+
+
+def depth_days(oldest: datetime, now: datetime) -> int:
+    return max((now.date() - oldest.date()).days, 0)
+
+
+def format_depth_report(depths: list[ChannelDepth], now: datetime) -> str:
+    """Return text: how many days of recordings NVR keeps, per camera too."""
+    if not depths:
+        return 'На регистраторе нет камер.'
+    recorded = [item.oldest for item in depths if item.oldest]
+    if not recorded:
+        lines = ['🤷 Записей не найдено ни по одной камере.']
+    else:
+        days = [depth_days(oldest, now) for oldest in recorded]
+        if min(days) == max(days):
+            lines = [f'💾 Запись хранится <b>{format_days(max(days))}</b>']
+        else:
+            lines = [
+                f'💾 Запись хранится <b>от {min(days)} до {format_days(max(days))}</b> '
+                '(зависит от камеры)'
+            ]
+        lines.append(f'Самая ранняя запись: {min(recorded).strftime(_DATE_FORMAT)}')
+        lines.append(f'Камер с записью: {len(recorded)} из {len(depths)}')
+    lines.append('')
+    for item in depths[:_DEPTH_MAX_LINES]:
+        name = f' {item.name[:_DEPTH_NAME_MAX_LEN]}' if item.name else ''
+        if item.oldest:
+            value = (
+                f'{format_days(depth_days(item.oldest, now))} '
+                f'(с {item.oldest.strftime("%d.%m")})'
+            )
+        elif item.error:
+            value = '⚠️ не удалось проверить'
+        else:
+            value = '❌ записи нет'
+        lines.append(f'{item.channel}.{name} — {value}')
+    if len(depths) > _DEPTH_MAX_LINES:
+        lines.append(f'… и ещё {len(depths) - _DEPTH_MAX_LINES}')
+    return '\n'.join(lines)
 
 
 @dataclass
@@ -176,6 +241,38 @@ class ArchiveService:
             'Found %d recording(s) on "%s" channel %s', len(recordings), nvr_id, channel
         )
         return recordings
+
+    async def get_depth(self, nvr_id: str) -> list[ChannelDepth]:
+        """Return the oldest recording of every camera of NVR.
+
+        Connection and password errors are raised, an error of one camera
+        is kept in its item.
+        """
+        client = self._clients[nvr_id]
+        channels = await client.get_channels()
+        semaphore = asyncio.Semaphore(_DEPTH_CONCURRENCY)
+
+        async def check(channel: int, name: str) -> ChannelDepth:
+            async with semaphore:
+                try:
+                    oldest = await client.get_oldest_recording(channel)
+                except (APIConnectionError, APIAuthError):
+                    raise
+                except Exception as err:
+                    self._log.warning(
+                        'Failed to get archive depth of "%s" channel %s: %s',
+                        nvr_id,
+                        channel,
+                        err,
+                    )
+                    return ChannelDepth(channel, name, error=str(err) or 'error')
+            return ChannelDepth(channel, name, oldest=oldest)
+
+        return list(
+            await asyncio.gather(
+                *(check(channel, name) for channel, name in channels.items())
+            )
+        )
 
     def part_seconds(self, recordings: list[Recording] | None) -> int:
         """Return length of one video so that it fits Telegram file limit."""

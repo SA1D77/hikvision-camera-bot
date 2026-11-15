@@ -1,7 +1,7 @@
 from abc import ABC
 from collections.abc import Generator
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import DirectoryPath, Field, field_validator, model_validator
 
@@ -278,7 +278,28 @@ class ArchiveSchema(StrictBaseModel):
     part_minutes: IntMin1 = 15
     # Who may export the archive. Empty list - all `chat_users`.
     users: list[int] = Field(default_factory=list)
+    # Login for NVRs without own `auth`: handy when it's the same everywhere.
+    auth: CamAPIAuthSchema | None = None
     nvrs: dict[Annotated[str, Field(pattern=r'^[a-z0-9_]+$')], ArchiveNvrSchema]
+
+    @model_validator(mode='before')
+    @classmethod
+    def set_default_auth(cls, data: Any) -> Any:
+        """Copy common `auth` to every NVR which has no own one."""
+        if not isinstance(data, dict):
+            return data
+        auth, nvrs = data.get('auth'), data.get('nvrs')
+        if auth is None or not isinstance(nvrs, dict):
+            return data
+        return {
+            **data,
+            'nvrs': {
+                nvr_id: {'auth': auth, **nvr}
+                if isinstance(nvr, dict) and 'auth' not in nvr
+                else nvr
+                for nvr_id, nvr in nvrs.items()
+            },
+        }
 
     @model_validator(mode='after')
     def validate_nvrs(self) -> Self:

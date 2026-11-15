@@ -911,3 +911,143 @@ async def test_time_without_recordings_offers_other_time(tmp_path, monkeypatch):
     message.text = '00:00-23:59'
     await handlers.on_time_range_text(bot, message)
     assert 'Слишком длинный отрезок' in message.reply_text.await_args.args[0]
+
+
+# Archive depth and common login.
+
+
+def test_common_auth_is_used_by_nvrs_without_own_one(tmp_path):
+    conf = _archive_conf(
+        tmp_path,
+        auth={'user': 'admin', 'password': 'common', 'type': 'digest'},
+        nvrs={
+            'a_1': {'description': 'A', 'host': 'http://10.0.0.1'},
+            'b_1': {
+                'description': 'B',
+                'host': 'http://10.0.0.2',
+                'auth': {'user': 'bot', 'password': 'own', 'type': 'basic'},
+            },
+        },
+    )
+    assert conf.nvrs['a_1'].auth.user == 'admin'
+    assert conf.nvrs['b_1'].auth.user == 'bot'
+
+    with pytest.raises(ValueError, match='auth'):
+        _archive_conf(
+            tmp_path, nvrs={'a_1': {'description': 'A', 'host': 'http://10.0.0.1'}}
+        )
+
+
+async def test_client_oldest_recording(tmp_path):
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content.decode())
+        return httpx.Response(200, text=SEARCH_XML)
+
+    client = _client(tmp_path, handler)
+    assert await client.get_oldest_recording(26) == datetime(2026, 11, 15, 13, 0)
+    assert '<maxResults>1</maxResults>' in bodies[0]
+    assert '<trackID>2601</trackID>' in bodies[0]
+
+    empty = _client(tmp_path, lambda _: httpx.Response(200, text=NO_MATCHES_XML))
+    assert await empty.get_oldest_recording(26) is None
+
+
+def test_format_days_and_depth_report():
+    from hikcamerabot.archive.service import (
+        ChannelDepth,
+        format_days,
+        format_depth_report,
+    )
+
+    assert [format_days(n) for n in (1, 2, 5, 11, 21, 31, 112)] == [
+        '1 день',
+        '2 дня',
+        '5 дней',
+        '11 дней',
+        '21 день',
+        '31 день',
+        '112 дней',
+    ]
+    now = datetime(2026, 11, 15, 12, 0)
+    report = format_depth_report(
+        [
+            ChannelDepth(1, 'Вход', oldest=datetime(2026, 10, 15, 3, 0)),
+            ChannelDepth(2, 'Склад', oldest=datetime(2026, 11, 1, 0, 0)),
+            ChannelDepth(3, ''),
+            ChannelDepth(4, 'Касса', error='boom'),
+        ],
+        now,
+    )
+    assert 'от 14 до 31 день' in report
+    assert 'Самая ранняя запись: 15.10.2026' in report
+    assert 'Камер с записью: 2 из 4' in report
+    assert '1. Вход — 31 день (с 15.10)' in report
+    assert '3. — ❌ записи нет' in report
+    assert '4. Касса — ⚠️ не удалось проверить' in report
+
+    same = format_depth_report(
+        [ChannelDepth(1, 'Вход', oldest=datetime(2026, 10, 15, 3, 0))], now
+    )
+    assert 'Запись хранится <b>31 день</b>' in same
+    assert 'Записей не найдено' in format_depth_report([ChannelDepth(1, '')], now)
+
+
+@requires_config
+async def test_depth_button_shows_report(tmp_path):
+    from hikcamerabot.archive import handlers
+
+    bot = _bot()
+    service = _service(tmp_path, bot)
+    client = service.client('nvr_1')
+    client.get_channels = AsyncMock(return_value={1: 'Вход', 2: 'Склад'})
+
+    async def oldest(channel):
+        if channel == 2:
+            raise HikvisionAPIError('no search')
+        return datetime.now() - timedelta(days=30)
+
+    client.get_oldest_recording = oldest
+    markup = handlers.build_channels_keyboard({1: 'Вход'}, 0, 0, None)
+    assert 'arc|h|0' in [
+        btn.callback_data for row in markup.inline_keyboard for btn in row
+    ]
+
+    query = _query('arc|h|0')
+    await handlers.on_archive_callback(bot, query)
+    text = query.message.edit_text.await_args.args[0]
+    assert 'Глубина архива' in text
+    assert '1. Вход — 30 дней' in text
+    assert '2. Склад — ⚠️ не удалось проверить' in text
+
+    client.get_channels = AsyncMock(side_effect=APIAuthError('403', status_code=403))
+    query = _query('arc|h|0')
+    await handlers.on_archive_callback(bot, query)
+    assert 'Не удалось получить данные' in query.message.edit_text.await_args.args[0]
+
+
+@requires_config
+async def test_region_with_one_nvr_opens_it_at_once(tmp_path):
+    from hikcamerabot.archive import handlers
+
+    auth = {'user': 'bot', 'password': 'pass', 'type': 'digest'}
+    nvrs = {
+        'tas_1': {'description': 'T1', 'group': 'Ташкент', 'host': 'http://a'},
+        'tas_2': {'description': 'T2', 'group': 'Ташкент', 'host': 'http://b'},
+        'urg_1': {'description': 'Urgench', 'group': 'Ургенч', 'host': 'http://c'},
+    }
+    bot = _bot()
+    service = _service(tmp_path, bot, nvrs=nvrs, auth=auth)
+    service.client('urg_1').get_channels = AsyncMock(return_value={1: 'Вход'})
+
+    query = _query('arc|r|1|0')
+    await handlers.on_archive_callback(bot, query)
+    args = query.message.edit_text.await_args
+    assert 'Urgench' in args.args[0]
+    labels = {
+        btn.text: btn.callback_data
+        for row in args.kwargs['reply_markup'].inline_keyboard
+        for btn in row
+    }
+    assert labels['⬅️ Регионы'] == 'arc|s'

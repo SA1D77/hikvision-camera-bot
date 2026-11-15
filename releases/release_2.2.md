@@ -23,7 +23,11 @@ Russian guide: [docs/NVR_ARCHIVE_RU.md](../docs/NVR_ARCHIVE_RU.md).
 8. One export per NVR at a time, the others wait in a queue. An export can be cancelled.
 9. Access can be limited with `archive.users`; every export is written to the log with the
    user, camera and period.
-10. Temporary files are stored in `archive.storage_path` (`/data/archive` volume) and removed
+10. Archive depth: "💾 Глубина архива" button in the camera list tells how many days of
+   recordings NVR keeps, per camera, and which cameras have no recordings.
+11. Common login: `archive.auth` is used by every NVR without own `auth`.
+12. A region with one NVR opens its cameras at once.
+13. Temporary files are stored in `archive.storage_path` (`/data/archive` volume) and removed
    right after sending.
 
 The feature is covered by tests but hasn't been tried on a real NVR yet: start with a short

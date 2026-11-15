@@ -28,6 +28,7 @@ from hikcamerabot.archive.service import (
     STREAM_NAMES,
     ArchiveJob,
     ArchiveService,
+    format_depth_report,
     format_minutes,
     format_period,
 )
@@ -58,6 +59,7 @@ _ACTION_DAY: Final[str] = 'd'
 _ACTION_GO: Final[str] = 'g'
 _ACTION_CLOSE: Final[str] = 'x'
 _ACTION_CANCEL_JOB: Final[str] = 'k'
+_ACTION_DEPTH: Final[str] = 'h'
 
 NVRS_PER_PAGE: Final[int] = 10
 CHANNELS_PER_PAGE: Final[int] = 10
@@ -80,7 +82,9 @@ HELP_TEXT: Final[str] = (
     'пришлёт кадр с неё, чтобы проверить ракурс. Затем «Выгрузить запись», '
     'день и время, например <code>13:30-14:00</code>. Бот проверит, есть ли '
     'запись, и пришлёт видео; длинные записи приходят по частям.\n'
-    'Быстро одной командой: <code>/archive 26 13:30-14:00</code>.'
+    'Быстро одной командой: <code>/archive 26 13:30-14:00</code>.\n'
+    'Кнопка «💾 Глубина архива» в списке камер показывает, за сколько дней '
+    'на регистраторе хранится запись.'
 )
 
 # Chat ID -> (NVR index, channel, day): the bot waits for a time range text.
@@ -206,6 +210,7 @@ def build_channels_keyboard(
     rows = _grid(buttons)
     if pages > 1:
         rows.append(_pager(_ACTION_NVR, nvr_idx, page, pages))
+    rows.append([_btn('💾 Глубина архива (сколько дней)', _ACTION_DEPTH, nvr_idx)])
     rows.append([back, _close_btn()] if back else [_close_btn()])
     return InlineKeyboardMarkup(rows)
 
@@ -292,15 +297,51 @@ def _group_step(
     )
 
 
+def _nvr_back_btn(service: ArchiveService, nvr_idx: int) -> InlineKeyboardButton | None:
+    """Return the button which leads from NVR to the list it was chosen from."""
+    if len(service.nvr_ids) == 1:
+        return None
+    groups = get_groups(service)
+    group_idx = _group_index(service, nvr_idx)
+    if len(groups) > 1 and len(groups[group_idx][1]) == 1:
+        # The only NVR of the region is opened right from the regions list.
+        return _btn('⬅️ Регионы', ACTION_START)
+    return _btn('⬅️ Регистраторы', _ACTION_GROUP, group_idx, 0)
+
+
+async def _depth_step(
+    service: ArchiveService, nvr_idx: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Tell how many days of recordings NVR keeps."""
+    nvr_id = service.nvr_ids[nvr_idx]
+    header = f'<b>💾 Глубина архива</b> — {service.nvr_description(nvr_id)}'
+    markup = InlineKeyboardMarkup(
+        [
+            [_btn('🔄 Обновить', _ACTION_DEPTH, nvr_idx)],
+            [_btn('⬅️ Камеры', _ACTION_NVR, nvr_idx, 0), _close_btn()],
+        ]
+    )
+    try:
+        depths = await service.get_depth(nvr_id)
+    except Exception as err:
+        log.warning('Failed to get archive depth of "%s": %s', nvr_id, err)
+        return (
+            f'{header}\n\nНе удалось получить данные.\n{describe_error(err)}',
+            markup,
+        )
+    now = datetime.now()  # noqa: DTZ005
+    return (
+        f'{header}\n{format_depth_report(depths, now)}\n\n'
+        f'Проверено {now.strftime("%d.%m.%Y %H:%M")}',
+        markup,
+    )
+
+
 async def _nvr_step(
     service: ArchiveService, nvr_idx: int, page: int
 ) -> tuple[str, InlineKeyboardMarkup]:
     nvr_id = service.nvr_ids[nvr_idx]
-    back = (
-        _btn('⬅️ Регистраторы', _ACTION_GROUP, _group_index(service, nvr_idx), 0)
-        if len(service.nvr_ids) > 1
-        else None
-    )
+    back = _nvr_back_btn(service, nvr_idx)
     try:
         channels = await service.client(nvr_id).get_channels()
     except Exception as err:
@@ -527,7 +568,7 @@ async def on_archive_callback(bot: 'CameraBot', query: CallbackQuery) -> None:
             await query.answer('❌ Ошибка, смотрите логи', show_alert=True)
 
 
-async def _process_action(  # noqa: C901, PLR0911, PLR0915
+async def _process_action(  # noqa: C901, PLR0911, PLR0912, PLR0915
     bot: 'CameraBot',
     query: CallbackQuery,
     message: Message,
@@ -562,6 +603,11 @@ async def _process_action(  # noqa: C901, PLR0911, PLR0915
         if not 0 <= group_idx < len(get_groups(service)):
             raise IndexError(group_idx)
         await query.answer()
+        nvr_indexes = get_groups(service)[group_idx][1]
+        if len(nvr_indexes) == 1:
+            # One NVR in the region: no need to choose it.
+            await _show(bot, message, *await _nvr_step(service, nvr_indexes[0], 0))
+            return
         await _show(bot, message, *_group_step(service, group_idx, int(args[1])))
         return
 
@@ -571,6 +617,11 @@ async def _process_action(  # noqa: C901, PLR0911, PLR0915
     if action == _ACTION_NVR:
         await query.answer()
         await _show(bot, message, *await _nvr_step(service, nvr_idx, int(args[1])))
+        return
+
+    if action == _ACTION_DEPTH:
+        await query.answer('💾 Проверяю архив по всем камерам...')
+        await _show(bot, message, *await _depth_step(service, nvr_idx))
         return
 
     channel = int(args[1])

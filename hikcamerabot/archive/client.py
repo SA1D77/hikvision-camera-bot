@@ -3,7 +3,7 @@
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import urljoin, urlsplit
@@ -38,6 +38,8 @@ _PLAYBACK_URI_SIZE_REGEX: Final[re.Pattern[str]] = re.compile(r'[?&]size=(\d+)')
 _CHANNELS_CACHE_TTL: Final[float] = 600.0
 _SEARCH_TIMEOUT: Final[float] = 30.0
 _SEARCH_MAX_RESULTS: Final[int] = 50
+# How far back the oldest recording is searched.
+_OLDEST_SEARCH_DAYS: Final[int] = 3650
 # Track ID is `<channel><stream>`: 2601 is channel 26 main stream, 2602 - sub.
 _TRACK_MULTIPLIER: Final[int] = 100
 
@@ -243,8 +245,28 @@ class NvrArchiveClient:
             )
         return channels
 
+    async def get_oldest_recording(self, channel: int) -> datetime | None:
+        """Return start of the oldest recording of the camera, None - no recordings.
+
+        NVR returns matches from the oldest one, so one result is enough.
+        """
+        now = datetime.now()  # noqa: DTZ005
+        recordings = await self.find_recordings(
+            channel,
+            now - timedelta(days=_OLDEST_SEARCH_DAYS),
+            now + timedelta(days=1),
+            StreamType.MAIN,
+            max_results=1,
+        )
+        return recordings[0].start if recordings else None
+
     async def find_recordings(
-        self, channel: int, start: datetime, end: datetime, stream: StreamType
+        self,
+        channel: int,
+        start: datetime,
+        end: datetime,
+        stream: StreamType,
+        max_results: int = _SEARCH_MAX_RESULTS,
     ) -> list[Recording]:
         """Return recordings of the period. Empty list - no recordings."""
         payload = _SEARCH_XML_TPL.format(
@@ -252,7 +274,7 @@ class NvrArchiveClient:
             track_id=track_id(channel, stream),
             start=start.strftime(_ISAPI_TIME_FORMAT),
             end=end.strftime(_ISAPI_TIME_FORMAT),
-            max_results=_SEARCH_MAX_RESULTS,
+            max_results=max_results,
         )
         text = await self._request(
             'POST', _SEARCH_ENDPOINT, data=payload, timeout=_SEARCH_TIMEOUT
