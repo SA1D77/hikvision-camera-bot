@@ -1009,6 +1009,7 @@ async def test_depth_button_shows_report(tmp_path):
         return datetime.now() - timedelta(days=30)
 
     client.get_oldest_recording = oldest
+    client.has_recent_recording = AsyncMock(return_value=False)
     markup = handlers.build_channels_keyboard({1: 'Вход'}, 0, 0, None)
     assert 'arc|h|0' in [
         btn.callback_data for row in markup.inline_keyboard for btn in row
@@ -1019,6 +1020,8 @@ async def test_depth_button_shows_report(tmp_path):
     text = query.message.edit_text.await_args.args[0]
     assert 'Глубина архива' in text
     assert '1. Вход — 30 дней' in text
+    assert 'за сутки записи нет' in text
+    assert 'За последние сутки писались: 0 из 2' in text
     assert '2. Склад — ⚠️ не удалось проверить' in text
 
     client.get_channels = AsyncMock(side_effect=APIAuthError('403', status_code=403))
@@ -1106,3 +1109,63 @@ async def test_failed_sub_stream_job_advises_main_stream(tmp_path):
     service._exporter.export = AsyncMock(side_effect=ArchiveExportError('400'))
     await service._run_job(_job(stream=StreamType.SUB))
     assert 'только основной поток' in _last_status(bot)
+
+
+# Any date, recordings of the day.
+
+
+def test_parse_day_and_time_range():
+    from hikcamerabot.archive.timeparse import parse_day_and_time_range
+
+    chosen = date(2026, 11, 14)
+    assert parse_day_and_time_range('09:00-11:00', chosen, TODAY) == (
+        datetime(2026, 11, 14, 9, 0),
+        datetime(2026, 11, 14, 11, 0),
+    )
+    # A typed date wins, also when no day was chosen.
+    for day in (chosen, None):
+        assert parse_day_and_time_range('13.10 09:00-11:00', day, TODAY) == (
+            datetime(2026, 10, 13, 9, 0),
+            datetime(2026, 10, 13, 11, 0),
+        )
+    assert parse_day_and_time_range('09.00 11.00', chosen, TODAY)[0].hour == 9
+    with pytest.raises(ArchiveInputError, match='дату и время'):
+        parse_day_and_time_range('09:00-11:00', None, TODAY)
+
+
+@requires_config
+async def test_other_date_button_waits_for_date_and_time(tmp_path, monkeypatch):
+    from hikcamerabot.archive import handlers
+
+    monkeypatch.setattr(handlers, '_pending', {})
+    bot = _bot()
+    service = _service(tmp_path, bot)
+    service.client('nvr_1').get_channels = AsyncMock(return_value={27: 'Ворота'})
+    markup = handlers.build_days_keyboard(0, 27, TODAY)
+    assert 'arc|d|0|27|0' in [
+        btn.callback_data for row in markup.inline_keyboard for btn in row
+    ]
+
+    query = _query('arc|d|0|27|0')
+    await handlers.on_archive_callback(bot, query)
+    assert handlers._pending == {1: (0, 27, None)}
+    assert 'дату и время' in query.message.edit_text.await_args.args[0]
+
+
+@requires_config
+async def test_describe_day_lists_recorded_time(tmp_path):
+    service = _service(tmp_path)
+    day = datetime(2026, 11, 13, 9, 15)
+    service.find_recordings = AsyncMock(
+        return_value=[
+            Recording(datetime(2026, 11, 13, 14, 2), datetime(2026, 11, 13, 14, 10))
+        ]
+    )
+    text = await service.describe_day('nvr_1', 6, day)
+    assert '13.11.2026' in text
+    assert '14:02–14:10' in text
+    args = service.find_recordings.await_args.args
+    assert args[2:4] == (datetime(2026, 11, 13), datetime(2026, 11, 14))
+
+    service.find_recordings = AsyncMock(return_value=[])
+    assert 'За весь день' in await service.describe_day('nvr_1', 6, day)

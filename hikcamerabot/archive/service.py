@@ -58,6 +58,7 @@ _MAX_SPANS_SHOWN: Final[int] = 4
 _DEPTH_CONCURRENCY: Final[int] = 4
 _DEPTH_NAME_MAX_LEN: Final[int] = 22
 _DEPTH_MAX_LINES: Final[int] = 70
+_DAY_SPANS_SHOWN: Final[int] = 12
 
 STREAM_NAMES: Final[dict[StreamType, str]] = {
     StreamType.MAIN: 'основной поток',
@@ -100,6 +101,8 @@ class ChannelDepth:
     name: str
     oldest: datetime | None = None
     error: str | None = None
+    # Was the camera recorded during the last 24 hours? None - not checked.
+    recent: bool | None = None
 
 
 def depth_days(oldest: datetime, now: datetime) -> int:
@@ -124,6 +127,13 @@ def format_depth_report(depths: list[ChannelDepth], now: datetime) -> str:
             ]
         lines.append(f'Самая ранняя запись: {min(recorded).strftime(_DATE_FORMAT)}')
         lines.append(f'Камер с записью: {len(recorded)} из {len(depths)}')
+        checked = [item for item in depths if item.recent is not None]
+        if checked:
+            recent = sum(1 for item in checked if item.recent)
+            mark = '✅' if recent == len(depths) else '⚠️'
+            lines.append(
+                f'{mark} За последние сутки писались: {recent} из {len(depths)}'
+            )
     lines.append('')
     for item in depths[:_DEPTH_MAX_LINES]:
         name = f' {item.name[:_DEPTH_NAME_MAX_LEN]}' if item.name else ''
@@ -132,6 +142,8 @@ def format_depth_report(depths: list[ChannelDepth], now: datetime) -> str:
                 f'{format_days(depth_days(item.oldest, now))} '
                 f'(с {item.oldest.strftime("%d.%m")})'
             )
+            if item.recent is False:
+                value += ' ⚠️ за сутки записи нет'
         elif item.error:
             value = '⚠️ не удалось проверить'
         else:
@@ -266,13 +278,50 @@ class ArchiveService:
                         err,
                     )
                     return ChannelDepth(channel, name, error=str(err) or 'error')
-            return ChannelDepth(channel, name, oldest=oldest)
+                recent = None
+                if oldest:
+                    try:
+                        recent = await client.has_recent_recording(channel)
+                    except Exception as err:
+                        self._log.warning(
+                            'Failed to check recent recordings of "%s" channel %s: %s',
+                            nvr_id,
+                            channel,
+                            err,
+                        )
+            return ChannelDepth(channel, name, oldest=oldest, recent=recent)
 
         return list(
             await asyncio.gather(
                 *(check(channel, name) for channel, name in channels.items())
             )
         )
+
+    async def describe_day(self, nvr_id: str, channel: int, day: datetime) -> str:
+        """Tell when the camera was recorded during the day of `day`.
+
+        Shown when there are no recordings for the asked time: the user sees
+        what NVR has and can choose another time.
+        """
+        day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        date_text = day_start.strftime(_DATE_FORMAT)
+        try:
+            recordings = await self.find_recordings(
+                nvr_id, channel, day_start, day_end, StreamType.MAIN
+            )
+        except Exception as err:
+            self._log.warning('Failed to get recordings of the day: %s', err)
+            return ''
+        spans = covered_spans(recordings or [], day_start, day_end)
+        if not spans:
+            return f'За весь день {date_text} регистратор не нашёл записей этой камеры.'
+        shown = ', '.join(
+            format_period(span_start, span_end)[_DATE_PREFIX_LEN:]
+            for span_start, span_end in spans[:_DAY_SPANS_SHOWN]
+        )
+        more = ' и другие' if len(spans) > _DAY_SPANS_SHOWN else ''
+        return f'В этот день ({date_text}) запись есть за: {shown}{more}.'
 
     def part_seconds(self, recordings: list[Recording] | None) -> int:
         """Return length of one video so that it fits Telegram file limit."""

@@ -40,6 +40,8 @@ _SEARCH_TIMEOUT: Final[float] = 30.0
 _SEARCH_MAX_RESULTS: Final[int] = 50
 # How far back the oldest recording is searched.
 _OLDEST_SEARCH_DAYS: Final[int] = 3650
+_RECENT_HOURS: Final[int] = 24
+_LOGGED_RESPONSE_SIZE: Final[int] = 400
 # Track ID is `<channel><stream>`: 2601 is channel 26 main stream, 2602 - sub.
 _TRACK_MULTIPLIER: Final[int] = 100
 
@@ -260,6 +262,19 @@ class NvrArchiveClient:
         )
         return recordings[0].start if recordings else None
 
+    async def has_recent_recording(self, channel: int) -> bool:
+        """Tell whether the camera was recorded during the last 24 hours."""
+        now = datetime.now()  # noqa: DTZ005
+        return bool(
+            await self.find_recordings(
+                channel,
+                now - timedelta(hours=_RECENT_HOURS),
+                now + timedelta(hours=1),
+                StreamType.MAIN,
+                max_results=1,
+            )
+        )
+
     async def find_recordings(
         self,
         channel: int,
@@ -280,9 +295,19 @@ class NvrArchiveClient:
             'POST', _SEARCH_ENDPOINT, data=payload, timeout=_SEARCH_TIMEOUT
         )
         try:
-            return parse_search_result(text)
+            recordings = parse_search_result(text)
         except Exception as err:
             raise HikvisionAPIError(f'Unexpected search response: {err}') from err
+        if not recordings:
+            # Helps to find out why NVR tells there are no recordings.
+            self._log.info(
+                'No recordings on track %s for %s - %s, NVR answered: %s',
+                track_id(channel, stream),
+                start.strftime(_ISAPI_TIME_FORMAT),
+                end.strftime(_ISAPI_TIME_FORMAT),
+                ' '.join(text.split())[:_LOGGED_RESPONSE_SIZE],
+            )
+        return recordings
 
     def playback_url(
         self, channel: int, start: datetime, end: datetime, stream: StreamType

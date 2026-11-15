@@ -33,10 +33,11 @@ from hikcamerabot.archive.service import (
     format_period,
 )
 from hikcamerabot.archive.timeparse import (
+    DAY_AND_TIME_HINT,
     TIME_RANGE_HINT,
     ArchiveInputError,
+    parse_day_and_time_range,
     parse_request,
-    parse_time_range,
 )
 from hikcamerabot.utils.errors import describe_error
 
@@ -88,7 +89,9 @@ HELP_TEXT: Final[str] = (
 )
 
 # Chat ID -> (NVR index, channel, day): the bot waits for a time range text.
-_pending: dict[int, tuple[int, int, date]] = {}
+# Without a day the bot waits for a date and a time range.
+_pending: dict[int, tuple[int, int, date | None]] = {}
+_OTHER_DAY_KEY: Final[str] = '0'
 
 
 def make_callback_data(action: str, *args: object) -> str:
@@ -241,6 +244,7 @@ def build_days_keyboard(
             _btn(text, _ACTION_DAY, nvr_idx, channel, day.strftime(_DAY_KEY_FORMAT))
         )
     rows = [buttons[:2], buttons[2:5], buttons[5:]]
+    rows.append([_btn('📅 Другая дата', _ACTION_DAY, nvr_idx, channel, _OTHER_DAY_KEY)])
     rows.append([_btn('⬅️ Камеры', _ACTION_NVR, nvr_idx, 0), _close_btn()])
     return InlineKeyboardMarkup([row for row in rows if row])
 
@@ -471,8 +475,9 @@ async def _send_confirmation(
 
     availability, exportable = service.describe_availability(recordings, start, end)
     if not exportable:
+        day_info = await service.describe_day(nvr_id, channel, start)
         await message.reply_text(
-            f'{header}\n\n{availability}\nПроверьте камеру и время.',
+            f'{header}\n\n{availability}\n{day_info}\nПроверьте камеру и время.',
             reply_markup=other_time,
             quote=True,
         )
@@ -526,7 +531,11 @@ async def on_time_range_text(bot: 'CameraBot', message: Message) -> None:
         return
     nvr_idx, channel, day = pending
     try:
-        start, end = parse_time_range(message.text or '', day)
+        start, end = parse_day_and_time_range(
+            message.text or '',
+            day,
+            today=datetime.now().date(),  # noqa: DTZ005
+        )
     except ArchiveInputError as err:
         await message.reply_text(
             f'⚠️ {err}\nИли отправьте /archive, чтобы начать заново.', quote=True
@@ -646,14 +655,23 @@ async def _process_action(  # noqa: C901, PLR0911, PLR0912, PLR0915
         return
 
     if action == _ACTION_DAY:
-        day = datetime.strptime(args[2], _DAY_KEY_FORMAT).date()  # noqa: DTZ007
+        day = (
+            None
+            if args[2] == _OTHER_DAY_KEY
+            else datetime.strptime(args[2], _DAY_KEY_FORMAT).date()  # noqa: DTZ007
+        )
         _pending[chat_id] = (nvr_idx, channel, day)
         await query.answer()
+        ask = (
+            f'🗓 {day.strftime("%d.%m.%Y")}\n\n'
+            f'Теперь отправьте время сообщением. {TIME_RANGE_HINT}'
+            if day
+            else f'Любая дата, пока запись хранится на регистраторе.\n{DAY_AND_TIME_HINT}'
+        )
         await _show(
             bot,
             message,
-            f'{header}\n🗓 {day.strftime("%d.%m.%Y")}\n\n'
-            f'Теперь отправьте время сообщением. {TIME_RANGE_HINT}\n'
+            f'{header}\n{ask}\n'
             f'Максимум за один раз — {format_minutes(service.max_duration)}.',
             InlineKeyboardMarkup(
                 [[_btn('⬅️ Назад', _ACTION_EXPORT, nvr_idx, channel), _close_btn()]]

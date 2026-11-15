@@ -15,6 +15,9 @@ _DAY_REGEX: Final[re.Pattern[str]] = re.compile(
 _DAY_WORDS: Final[dict[str, int]] = {'сегодня': 0, 'вчера': 1, 'позавчера': 2}
 
 TIME_RANGE_HINT: Final[str] = 'Время пишите так: 13:30-14:00'
+DAY_AND_TIME_HINT: Final[str] = (
+    'Напишите дату и время, например: <code>13.11 09:00-11:00</code>'
+)
 REQUEST_HINT: Final[str] = (
     'Формат: номер камеры, дата (необязательно) и время.\n'
     'Примеры:\n'
@@ -82,6 +85,26 @@ def parse_day(text: str, today: date) -> date:
         return result if result <= today else date(today.year - 1, month, day)
     except ValueError as err:
         raise ArchiveInputError(f'Нет такой даты: {text.strip()}') from err
+
+
+def parse_day_and_time_range(
+    text: str, day: date | None, today: date
+) -> tuple[datetime, datetime]:
+    """Parse `13.11 09:00-11:00` or just `09:00-11:00` for the chosen `day`.
+
+    A typed date has priority over the chosen day. Without both it's an error.
+    """
+    tokens = text.split()
+    if len(tokens) > 1:
+        try:
+            typed_day = parse_day(tokens[0], today)
+        except ArchiveInputError:
+            pass
+        else:
+            return parse_time_range(' '.join(tokens[1:]), typed_day)
+    if day is None:
+        raise ArchiveInputError(f'Не понял «{text.strip()}». {DAY_AND_TIME_HINT}')
+    return parse_time_range(text, day)
 
 
 def parse_request(text: str, today: date) -> ArchiveRequest:
