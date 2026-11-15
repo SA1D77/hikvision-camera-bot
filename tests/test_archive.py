@@ -441,7 +441,7 @@ async def test_job_exports_and_sends_every_part(tmp_path, monkeypatch):
     service.client('nvr_1').find_recordings = AsyncMock(side_effect=RuntimeError)
     exported = []
 
-    async def fake_export(url, file_path, duration, on_progress=None):
+    async def fake_export(url, file_path, duration, on_progress=None, **_):
         exported.append((url, duration))
         file_path.write_bytes(b'video')
         if on_progress:
@@ -479,7 +479,7 @@ async def test_job_reports_too_big_file(tmp_path, monkeypatch):
     service = _service(tmp_path, bot, part_minutes=60)
     service.client('nvr_1').find_recordings = AsyncMock(return_value=[_recording()])
 
-    async def fake_export(url, file_path, duration, on_progress=None):
+    async def fake_export(url, file_path, duration, on_progress=None, **_):
         file_path.write_bytes(b'12345678')
 
     service._exporter.export = fake_export
@@ -773,7 +773,7 @@ async def test_job_skips_parts_without_recordings(tmp_path, monkeypatch):
     )
     exported = []
 
-    async def fake_export(url, file_path, duration, on_progress=None):
+    async def fake_export(url, file_path, duration, on_progress=None, **_):
         exported.append(duration)
         file_path.write_bytes(b'video')
 
@@ -1420,3 +1420,108 @@ async def test_remux_is_repeated_without_audio(tmp_path):
     with pytest.raises(ArchiveExportError, match='boom'):
         await exporter._remux(tmp_path / 'a.mkv', target)
     assert not target.exists()
+
+
+# Download of recorded files instead of the playback.
+
+URI = (
+    'rtsp://10.1.1.1/Streaming/tracks/601/?starttime=20261114T090000Z'
+    '&endtime=20261114T100000Z&name=00010000123000000&size=900000000'
+)
+
+
+def test_clip_playback_uri_and_parsed_uri():
+    from hikcamerabot.archive.client import clip_playback_uri
+
+    clipped = clip_playback_uri(
+        URI, datetime(2026, 11, 14, 9, 23), datetime(2026, 11, 14, 9, 30)
+    )
+    assert 'starttime=20261114T092300Z&endtime=20261114T093000Z' in clipped
+    assert clipped.endswith('&name=00010000123000000&size=900000000')
+
+    recordings = parse_search_result(SEARCH_XML)
+    assert recordings[0].uri is None
+    assert recordings[1].uri.startswith('rtsp://192.168.1.10/Streaming/tracks/2601/')
+    assert '&name=ch26_02&size=900000000' in recordings[1].uri
+
+
+async def test_client_download(tmp_path):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen['path'] = request.url.path
+        seen['body'] = request.content.decode()
+        return httpx.Response(200, content=b'v' * 10_000)
+
+    client = _client(tmp_path, handler)
+    chunks = []
+
+    async def on_chunk(size):
+        chunks.append(size)
+
+    target = tmp_path / 'piece.bin'
+    assert await client.download(URI, target, on_chunk) == 10_000
+    assert target.stat().st_size == 10_000
+    assert sum(chunks) == 10_000
+    assert seen['path'] == '/ISAPI/ContentMgmt/download'
+    assert '&amp;name=00010000123000000' in seen['body']
+
+    refusing = _client(tmp_path, lambda _: httpx.Response(200, content=b'<xml/>'))
+    with pytest.raises(HikvisionAPIError, match='no video'):
+        await refusing.download(URI, target)
+    with pytest.raises(HikvisionAPIError, match='more than expected'):
+        await client.download(URI, target, max_size=5000)
+
+
+@requires_config
+async def test_part_is_downloaded_and_playback_is_fallback(tmp_path):
+    from hikcamerabot.archive.exporter import build_concat_cmd
+
+    bot = _bot()
+    service = _service(tmp_path, bot)
+    job = _job()
+    client = service.client('nvr_1')
+    recording = Recording(job.start, job.end, size=1000, uri=URI)
+    service.find_recordings = AsyncMock(return_value=[recording])
+    service._send_part = AsyncMock()
+    downloaded = []
+
+    async def download(uri, piece, on_chunk=None, max_size=None):
+        downloaded.append(uri)
+        piece.write_bytes(b'video')
+        await on_chunk(5)
+        return 5
+
+    async def convert(sources, file_path):
+        assert [source.read_bytes() for source in sources] == [b'video']
+        file_path.write_bytes(b'mp4')
+
+    client.download = download
+    service._exporter.convert = convert
+    service._exporter.export = AsyncMock()
+    await service._run_job(job)
+    # 30 minutes are two parts of 15 minutes.
+    assert len(downloaded) == 2
+    assert (
+        'starttime=20261114T134500Z' in downloaded[1] or 'starttime=' in downloaded[1]
+    )
+    service._exporter.export.assert_not_awaited()
+    assert service._send_part.await_count == 2
+
+    # NVR which can't give files: the playback is used, now and later.
+    client.download = AsyncMock(side_effect=HikvisionAPIError('not supported'))
+
+    async def fake_export(url, file_path, duration, on_progress=None, **kwargs):
+        assert kwargs['recorded_seconds'] > 0
+        file_path.write_bytes(b'mp4')
+
+    service._exporter.export = fake_export
+    await service._run_job(_job())
+    await service._run_job(_job())
+    assert client.download.await_count == 1
+    assert service._send_part.await_count == 6
+
+    cmd = build_concat_cmd(tmp_path / 'list.txt', tmp_path / 'a.mp4')
+    args = shlex.split(cmd)
+    assert args[args.index('-f') + 1] == 'concat'
+    assert args[-1] == (tmp_path / 'a.mp4').as_posix()

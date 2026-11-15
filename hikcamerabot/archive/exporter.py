@@ -40,6 +40,14 @@ _REMUX_CMD_TPL: Final[str] = (
     '"{file_path}"'
 )
 _REMUX_AUDIO_ARGS: Final[str] = '-map 0:a? -c:a aac'
+# Downloaded files are joined in the order of the list file.
+_CONCAT_CMD_TPL: Final[str] = (
+    f'{FFMPEG_BIN} -y -loglevel error '
+    '-f concat -safe 0 -i "{list_path}" '
+    '-map 0:v:0 {audio} -c:v copy '
+    '-movflags +faststart '
+    '"{file_path}"'
+)
 # Some cameras send audio which ffmpeg can't save: then video only.
 _NO_AUDIO_ARGS: Final[str] = '-an'
 # NVR refused the playback itself: a try without audio won't help.
@@ -48,6 +56,8 @@ _SERVER_ERROR_MARK: Final[str] = 'Server returned'
 _POLL_PERIOD: Final[float] = 5.0
 # NVR sends nothing: no recording for this time or the connection is stuck.
 _STALL_TIMEOUT: Final[float] = 60.0
+# The whole recorded time is already received: the silence means the end.
+_END_STALL_TIMEOUT: Final[float] = 15.0
 _REMUX_TIMEOUT: Final[float] = 900.0
 _ERROR_TAIL_SIZE: Final[int] = 2000
 
@@ -74,6 +84,15 @@ def build_remux_cmd(source: Path, file_path: Path, audio: bool = True) -> str:
     """Return the command which repacks the saved file to MP4."""
     return _REMUX_CMD_TPL.format(
         source=source.as_posix(),
+        file_path=file_path.as_posix(),
+        audio=_REMUX_AUDIO_ARGS if audio else _NO_AUDIO_ARGS,
+    )
+
+
+def build_concat_cmd(list_path: Path, file_path: Path, audio: bool = True) -> str:
+    """Return the command which joins downloaded files into one MP4."""
+    return _CONCAT_CMD_TPL.format(
+        list_path=list_path.as_posix(),
         file_path=file_path.as_posix(),
         audio=_REMUX_AUDIO_ARGS if audio else _NO_AUDIO_ARGS,
     )
@@ -111,6 +130,7 @@ class ArchiveExporter:
         self._log = logging.getLogger(self.__class__.__name__)
         # Cameras whose audio can't be saved: exported without it at once.
         self._no_audio_tracks: set[str] = set()
+        self._recorded_seconds: float | None = None
 
     async def export(
         self,
@@ -118,18 +138,37 @@ class ArchiveExporter:
         file_path: Path,
         duration: int,
         on_progress: ProgressCallback | None = None,
+        recorded_seconds: float | None = None,
     ) -> None:
         """Record `duration` seconds from playback `url` to MP4 `file_path`.
 
+        `recorded_seconds` is how much of the period is really recorded: NVR
+        doesn't close the connection after it, so the export is stopped soon.
         Raise `ArchiveExportError` if nothing was recorded. The process is
         stopped when the task is cancelled.
         """
+        self._recorded_seconds = recorded_seconds
         captured = file_path.with_suffix('.mkv')
         try:
             await self._capture(url, captured, duration, on_progress)
             await self._remux(captured, file_path)
         finally:
             captured.unlink(missing_ok=True)
+
+    async def convert(self, sources: list[Path], file_path: Path) -> None:
+        """Join files downloaded from NVR into one MP4."""
+        list_path = file_path.with_suffix('.txt')
+        list_path.write_text(
+            ''.join(f"file '{source.as_posix()}'\n" for source in sources),
+            encoding='utf-8',
+        )
+        try:
+            await self._make_mp4(
+                lambda audio: build_concat_cmd(list_path, file_path, audio=audio),
+                file_path,
+            )
+        finally:
+            list_path.unlink(missing_ok=True)
 
     async def _capture(
         self,
@@ -196,13 +235,19 @@ class ArchiveExporter:
             self._log.info('ffmpeg said: %s', errors[-_ERROR_TAIL_SIZE:].strip())
 
     async def _remux(self, source: Path, file_path: Path) -> None:
-        """Repack the saved file to MP4, without audio if it can't be converted."""
+        """Repack the saved file to MP4."""
+        await self._make_mp4(
+            lambda audio: build_remux_cmd(source, file_path, audio=audio), file_path
+        )
+
+    async def _make_mp4(
+        self, build_cmd: Callable[[bool], str], file_path: Path
+    ) -> None:
+        """Run ffmpeg which makes MP4, without audio if it can't be converted."""
         errors = ''
         for audio in (True, False):
             file_path.unlink(missing_ok=True)
-            returncode, errors = await self._run(
-                build_remux_cmd(source, file_path, audio=audio)
-            )
+            returncode, errors = await self._run(build_cmd(audio))
             if returncode == 0 and _file_size(file_path) > 0:
                 return
             self._log.warning(
@@ -240,7 +285,8 @@ class ArchiveExporter:
         # Playback usually goes in real time; give it a reserve.
         deadline = time.monotonic() + duration * 2 + _STALL_TIMEOUT
         last_size = 0
-        last_growth = time.monotonic()
+        started_at = last_growth = time.monotonic()
+        recorded = self._recorded_seconds
         while True:
             try:
                 await asyncio.wait_for(asyncio.shield(proc.wait()), _POLL_PERIOD)
@@ -255,7 +301,12 @@ class ArchiveExporter:
                 last_size, last_growth = size, now
                 if on_progress:
                     await on_progress(size)
-            elif now - last_growth > _STALL_TIMEOUT:
+            elif now - last_growth > _STALL_TIMEOUT or (
+                recorded is not None
+                and last_size > 0
+                and now - started_at >= recorded
+                and now - last_growth > _END_STALL_TIMEOUT
+            ):
                 self._log.warning('NVR sends nothing more, stopping: %s', file_path)
                 return
             if now > deadline:

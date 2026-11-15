@@ -1,6 +1,6 @@
 """Recordings found on NVR: coverage of a period and size estimation."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Final
 
@@ -21,6 +21,8 @@ class Recording:
     start: datetime
     end: datetime
     size: int | None = None
+    # Address of the file on NVR, needed to download it.
+    uri: str | None = field(default=None, compare=False)
 
     @property
     def seconds(self) -> float:

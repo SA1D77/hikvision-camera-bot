@@ -5,9 +5,11 @@ import re
 import time
 from datetime import datetime, timedelta
 from enum import IntEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
+from xml.sax.saxutils import escape
 
 import httpx
 import xmltodict
@@ -25,6 +27,8 @@ from hikcamerabot.exceptions import (
 from hikcamerabot.utils.url import url_credential
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from hikcamerabot.config.schemas.main_config import ArchiveNvrSchema
 
 _CHANNELS_ENDPOINT: Final[str] = 'ISAPI/ContentMgmt/InputProxy/channels'
@@ -32,6 +36,17 @@ _STREAMING_CHANNELS_ENDPOINT: Final[str] = 'ISAPI/Streaming/channels'
 _SEARCH_ENDPOINT: Final[str] = 'ISAPI/ContentMgmt/search'
 _PICTURE_ENDPOINT: Final[str] = 'ISAPI/Streaming/channels/{track_id}/picture'
 _TIME_ENDPOINT: Final[str] = 'ISAPI/System/time'
+_DOWNLOAD_ENDPOINT: Final[str] = 'ISAPI/ContentMgmt/download'
+_DOWNLOAD_XML_TPL: Final[str] = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<downloadRequest><playbackURI>{uri}</playbackURI></downloadRequest>'
+)
+_DOWNLOAD_READ_TIMEOUT: Final[float] = 60.0
+_DOWNLOAD_CHUNK_SIZE: Final[int] = 256 * 1024
+# NVR answers with a short XML instead of video when it refuses.
+_MIN_VIDEO_SIZE: Final[int] = 4096
+_URI_START_REGEX: Final[re.Pattern[str]] = re.compile(r'starttime=[^&]*')
+_URI_END_REGEX: Final[re.Pattern[str]] = re.compile(r'endtime=[^&]*')
 _SNAPSHOT_TIMEOUT: Final[float] = 15.0
 # `...&name=ch26_0001&size=1049123456`: size of the recorded file in bytes.
 _PLAYBACK_URI_SIZE_REGEX: Final[re.Pattern[str]] = re.compile(r'[?&]size=(\d+)')
@@ -133,11 +148,25 @@ def parse_device_time(xml_text: str) -> datetime:
     return datetime.fromisoformat(str(root['localTime'])).replace(tzinfo=None)
 
 
+def _playback_uri(item: dict) -> str | None:
+    descriptor = item.get('mediaSegmentDescriptor') or {}
+    return str(descriptor.get('playbackURI') or '').strip() or None
+
+
 def _parse_size(item: dict) -> int | None:
     """Get recorded file size from `playbackURI`, if NVR reports it."""
-    descriptor = item.get('mediaSegmentDescriptor') or {}
-    match = _PLAYBACK_URI_SIZE_REGEX.search(str(descriptor.get('playbackURI') or ''))
+    match = _PLAYBACK_URI_SIZE_REGEX.search(_playback_uri(item) or '')
     return int(match[1]) if match else None
+
+
+def clip_playback_uri(uri: str, start: datetime, end: datetime) -> str:
+    """Return address of a recorded file limited to the given period."""
+    uri = _URI_START_REGEX.sub(
+        f'starttime={start.strftime(_RTSP_TIME_FORMAT)}', uri, count=1
+    )
+    return _URI_END_REGEX.sub(
+        f'endtime={end.strftime(_RTSP_TIME_FORMAT)}', uri, count=1
+    )
 
 
 def parse_search_result(xml_text: str) -> list[Recording]:
@@ -155,6 +184,7 @@ def parse_search_result(xml_text: str) -> list[Recording]:
                     ),
                     end=datetime.strptime(time_span['endTime'], _ISAPI_TIME_FORMAT),  # noqa: DTZ007
                     size=_parse_size(item),
+                    uri=_playback_uri(item),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -219,6 +249,55 @@ class NvrArchiveClient:
                 f'NVR returned an error: {status_code}', status_code=status_code
             )
         return response
+
+    async def download(
+        self,
+        uri: str,
+        file_path: Path,
+        on_chunk: 'Callable[[int], Awaitable[None]] | None' = None,
+        max_size: int | None = None,
+    ) -> int:
+        """Download a recorded file (or its period) by its playback address.
+
+        It's much faster than the playback: NVR sends the file as fast as the
+        network allows. Return the number of saved bytes.
+        """
+        url = urljoin(f'{self._base_url}/', _DOWNLOAD_ENDPOINT)
+        size = 0
+        try:
+            async with self._session.stream(
+                'POST',
+                url,
+                content=_DOWNLOAD_XML_TPL.format(uri=escape(uri)),
+                headers=XML_HEADERS,
+                timeout=httpx.Timeout(CONN_TIMEOUT, read=_DOWNLOAD_READ_TIMEOUT),
+            ) as response:
+                status_code = response.status_code
+                if status_code in (httpx.codes.UNAUTHORIZED, httpx.codes.FORBIDDEN):
+                    raise APIAuthError(
+                        f'NVR rejected the download: {status_code}',
+                        status_code=status_code,
+                    )
+                if httpx.codes.is_error(status_code):
+                    raise APIBadResponseCodeError(
+                        f'NVR refused the download: {status_code}',
+                        status_code=status_code,
+                    )
+                with file_path.open('wb') as file:
+                    async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_SIZE):
+                        file.write(chunk)
+                        size += len(chunk)
+                        if max_size is not None and size > max_size:
+                            raise HikvisionAPIError(
+                                f'NVR sends more than expected: over {max_size} bytes'
+                            )
+                        if on_chunk:
+                            await on_chunk(len(chunk))
+        except httpx.TransportError as err:
+            raise APIConnectionError(f'Download from NVR failed: {url}') from err
+        if size < _MIN_VIDEO_SIZE:
+            raise HikvisionAPIError(f'NVR sent no video: {size} bytes')
+        return size
 
     async def get_snapshot(self, channel: int) -> bytes:
         """Return current JPEG picture of the camera."""

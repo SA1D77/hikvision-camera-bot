@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING, Final
 
 from pyrogram.enums import ChatAction
 
-from hikcamerabot.archive.client import NvrArchiveClient, StreamType
+from hikcamerabot.archive.client import (
+    NvrArchiveClient,
+    StreamType,
+    clip_playback_uri,
+)
 from hikcamerabot.archive.exporter import (
     ArchiveExporter,
     ArchiveExportError,
@@ -38,7 +42,7 @@ from hikcamerabot.utils.system import get_disk_usage
 from hikcamerabot.utils.task import create_task
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from pyrogram.types import InlineKeyboardMarkup
 
@@ -62,6 +66,8 @@ _DEPTH_NAME_MAX_LEN: Final[int] = 14
 _DEPTH_MAX_LINES: Final[int] = 70
 _DAY_SPANS_SHOWN: Final[int] = 12
 _DAYS_CHECK_TIMEOUT: Final[float] = 12.0
+# A downloaded part can't be much bigger than a file Telegram accepts.
+_DOWNLOAD_MAX_SIZE: Final[int] = 3 * 1024**3
 _CLOCK_MAX_DIFF: Final[timedelta] = timedelta(minutes=5)
 
 STREAM_NAMES: Final[dict[StreamType, str]] = {
@@ -207,6 +213,8 @@ class ArchiveService:
         self._locks = {nvr_id: asyncio.Lock() for nvr_id in conf.nvrs}
         self._exporter = ArchiveExporter()
         self._jobs: dict[str, ArchiveJob] = {}
+        # NVRs which can't give recorded files: the playback is used at once.
+        self._no_download: set[str] = set()
         # Set by handlers: builds "Cancel" keyboard for a job.
         self.cancel_markup: Callable[[str], InlineKeyboardMarkup] | None = None
 
@@ -556,7 +564,9 @@ class ArchiveService:
         sent = 0
         for idx, (start, end) in enumerate(parts, start=1):
             part_label = f'часть {idx} из {len(parts)}' if len(parts) > 1 else ''
-            if await self._export_part(job, client, work_dir, start, end, part_label):
+            if await self._export_part(
+                job, client, work_dir, start, end, part_label, recordings
+            ):
                 sent += 1
 
         if sent:
@@ -586,8 +596,13 @@ class ArchiveService:
         start: datetime,
         end: datetime,
         part_label: str,
+        recordings: list[Recording] | None = None,
     ) -> bool:
-        """Export and send one part. Return False if the part failed."""
+        """Export and send one part. Return False if the part failed.
+
+        Recorded files are downloaded from NVR: it's many times faster than
+        the playback, which is used when NVR can't give the files.
+        """
         file_path = work_dir / (
             f'nvr_ch{job.channel}_{start.strftime(_FILENAME_FORMAT)}.mp4'
         )
@@ -609,13 +624,18 @@ class ArchiveService:
 
         await self._set_status(job, f'📥 Выгружаю{label}...')
         url = client.playback_url(job.channel, start, end, job.stream)
+        spans = covered_spans(recordings or [], start, end)
         try:
-            await self._exporter.export(
-                url=url,
-                file_path=file_path,
-                duration=int((end - start).total_seconds()),
-                on_progress=on_progress,
-            )
+            if not await self._download_part(
+                job, client, recordings, file_path, start, end, on_progress
+            ):
+                await self._exporter.export(
+                    url=url,
+                    file_path=file_path,
+                    duration=int((end - start).total_seconds()),
+                    on_progress=on_progress,
+                    recorded_seconds=covered_seconds(spans) if spans else None,
+                )
         except ArchiveExportError as err:
             self._log.error('Archive part %s failed: %s', file_path.name, err)
             await self._notify(
@@ -629,6 +649,72 @@ class ArchiveService:
             await self._send_part(job, file_path, start, end, part_label)
         finally:
             file_path.unlink(missing_ok=True)
+        return True
+
+    async def _download_part(
+        self,
+        job: ArchiveJob,
+        client: NvrArchiveClient,
+        recordings: list[Recording] | None,
+        file_path: Path,
+        start: datetime,
+        end: datetime,
+        on_progress: 'Callable[[int], Awaitable[None]]',
+    ) -> bool:
+        """Download recorded files of the part and join them into MP4.
+
+        Return False if it's not possible: the playback is used then.
+        """
+        files = [rec for rec in recordings or [] if rec.end > start and rec.start < end]
+        if (
+            job.nvr_id in self._no_download
+            or not files
+            or any(not rec.uri for rec in files)
+        ):
+            return False
+
+        started_at = time.monotonic()
+        pieces: list[Path] = []
+        total = 0
+
+        async def on_chunk(size: int) -> None:
+            nonlocal total
+            total += size
+            await on_progress(total)
+
+        try:
+            for idx, rec in enumerate(files):
+                piece = file_path.with_name(f'{file_path.stem}_{idx:03d}.bin')
+                pieces.append(piece)
+                uri = clip_playback_uri(
+                    rec.uri, max(rec.start, start), min(rec.end, end)
+                )
+                await client.download(
+                    uri, piece, on_chunk, max_size=_DOWNLOAD_MAX_SIZE - total
+                )
+            await self._exporter.convert(pieces, file_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            self._log.warning(
+                'Download from "%s" failed, the playback will be used: %s: %s',
+                job.nvr_id,
+                err.__class__.__name__,
+                err,
+            )
+            self._no_download.add(job.nvr_id)
+            file_path.unlink(missing_ok=True)
+            return False
+        finally:
+            for piece in pieces:
+                piece.unlink(missing_ok=True)
+        self._log.info(
+            'Downloaded %d file(s), %d bytes in %d s from "%s"',
+            len(files),
+            total,
+            time.monotonic() - started_at,
+            job.nvr_id,
+        )
         return True
 
     async def _send_part(
